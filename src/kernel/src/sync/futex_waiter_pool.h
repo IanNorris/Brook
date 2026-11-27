@@ -22,6 +22,10 @@ struct FutexWaiter {
     // futex_waitv reads it to learn which of its stack nodes a waker took.
     bool         queued;
     bool         multi;   // futex_waitv stack node; never matched by (key, proc)
+    // Diagnostics only (/proc/<pid>/futex): the waiter's own view at enqueue.
+    uint32_t     expected;
+    uint64_t     userAddress;
+    uint64_t     physical; // frame address of the word when queued; read-only peek
     FutexWaiter* next;    // Next in hash bucket chain
 };
 

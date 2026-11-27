@@ -165,6 +165,33 @@ extern "C" void FutexDumpWaiters()
     }
 }
 
+// /proc/<pid>/futex: every queued futex node of that task or thread group,
+// with the waiter's expected value beside the word's current value (read
+// through the frame captured at enqueue). current != expected on a long
+// wait means a wake did not reach this key; equal means nobody signalled.
+extern "C" uint32_t FutexSnapshotTask(uint32_t pid, FutexTaskSnapshot* out, uint32_t capacity)
+{
+    uint32_t count = 0;
+    const uint64_t flags = IrqSpinLockAcquire(&g_futexLock);
+    for (uint32_t b = 0; b < FUTEX_HASH_SIZE; ++b) {
+        for (FutexWaiter* w = g_futexBuckets[b]; w; w = w->next) {
+            Process* p = w->proc;
+            if (!p || p->magic != PROCESS_MAGIC || (p->pid != pid && p->tgid != pid)) continue;
+            if (count < capacity) {
+                FutexTaskSnapshot& e = out[count];
+                e.tid = p->pid; e.multi = w->multi; e.expected = w->expected;
+                e.userAddress = w->userAddress; e.owner = w->owner; e.key = w->uaddr;
+                e.current = w->physical
+                    ? __atomic_load_n(reinterpret_cast<volatile uint32_t*>(PhysToVirt(PhysicalAddress(w->physical)).raw()), __ATOMIC_RELAXED)
+                    : 0xffffffffu;
+            }
+            ++count;
+        }
+    }
+    IrqSpinLockRelease(&g_futexLock, flags);
+    return count;
+}
+
 static uint32_t FutexHash(uint64_t owner, uint64_t addr)
 {
     return static_cast<uint32_t>(((addr >> 2) ^ owner) % FUTEX_HASH_SIZE);
@@ -628,6 +655,9 @@ int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
         w->bitset = waitBitset;
         w->queued = true;
         w->multi = false;
+        w->expected = static_cast<uint32_t>(val);
+        w->userAddress = uaddrVal;
+        w->physical = VmmVirtToPhys(proc->addressSpace->pageTable, VirtualAddress(uaddrVal)).raw();
         uint32_t bucket = FutexHash(owner, keyAddress);
         ProcessRef(proc); // owned by linked waiter, then wake/remove/cancel
         w->next = g_futexBuckets[bucket];
@@ -759,6 +789,9 @@ static int FutexWaitvQueueOne(Process* proc, FutexWaiter* node, const FutexWaitv
         node->bitset = FUTEX_BITSET_MATCH_ANY;
         node->multi = true;
         node->queued = true;
+        node->expected = static_cast<uint32_t>(entry.val);
+        node->userAddress = address;
+        node->physical = VmmVirtToPhys(proc->addressSpace->pageTable, VirtualAddress(address)).raw();
         ProcessRef(proc); // owned by the linked node, then wake/unqueue/cancel
         const uint32_t bucket = FutexHash(owner, key);
         node->next = g_futexBuckets[bucket];

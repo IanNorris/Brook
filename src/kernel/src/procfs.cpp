@@ -12,6 +12,8 @@
 // Linux /proc layout that busybox ps/top expect.
 
 #include "procfs.h"
+#include "futex_waitv.h"
+extern "C" uint32_t FutexSnapshotTask(uint32_t pid, brook::FutexTaskSnapshot* out, uint32_t capacity);
 #include "synthetic_system_files.h"
 #include "proc_inode.h"
 #include "vfs.h"
@@ -108,7 +110,7 @@ static char* I64ToDec(char* buf, int64_t val)
     return U64ToDec(buf, static_cast<uint64_t>(val));
 }
 
-// Simple format: %u, %lu, %d, %ld, %s, %c — enough for /proc files.
+// Simple format: %u, %lu, %d, %ld, %x, %lx, %s, %c — enough for /proc files.
 static uint32_t ProcFmt(char* buf, uint32_t bufSize, const char* fmt, ...)
 {
     __builtin_va_list ap;
@@ -132,6 +134,12 @@ static uint32_t ProcFmt(char* buf, uint32_t bufSize, const char* fmt, ...)
         case 'd': {
             int64_t v = isLong ? __builtin_va_arg(ap, int64_t) : __builtin_va_arg(ap, int32_t);
             char tmp[21]; char* t = I64ToDec(tmp, v);
+            for (char* s = tmp; s < t && p < end; ) *p++ = *s++;
+            break;
+        }
+        case 'x': {
+            uint64_t v = isLong ? __builtin_va_arg(ap, uint64_t) : __builtin_va_arg(ap, uint32_t);
+            char tmp[17]; char* t = U64ToHex(tmp, v);
             for (char* s = tmp; s < t && p < end; ) *p++ = *s++;
             break;
         }
@@ -886,6 +894,28 @@ static Vnode* GenPidWchan(const ProcessSnapshot& proc)
     return MakeProcVnode(buf, n);
 }
 
+// /proc/[pid]/futex (Brook) — queued futex/futex_waitv nodes of the task or
+// its thread group: tid, wait kind, user VA, expected and current word value
+// and the hash key (private TGID/VA, memfd inode/offset or file object/offset).
+static Vnode* GenPidFutex(const ProcessSnapshot& proc)
+{
+    constexpr uint32_t Rows = 48, Capacity = 96 * Rows + 64;
+    FutexTaskSnapshot local[Rows];
+    const uint32_t total = FutexSnapshotTask(proc.pid, local, Rows);
+    auto* buf = static_cast<char*>(kmalloc(Capacity));
+    if (!buf) return nullptr;
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < total && i < Rows; ++i) {
+        const auto& e = local[i];
+        const char* domain = !(e.owner >> 63) ? "private" : ((e.owner >> 62) & 1) ? "file" : "memfd";
+        n += ProcFmt(buf + n, Capacity - n, "tid=%u %s va=0x%lx expected=%u current=%u key=%s:%lu+0x%lx\n",
+                     e.tid, e.multi ? "waitv" : "wait", e.userAddress, e.expected, e.current, domain,
+                     (unsigned long)(e.owner & ((uint64_t{1} << 62) - 1)), e.key);
+    }
+    if (total > Rows) n += ProcFmt(buf + n, Capacity - n, "... %u more\n", total - Rows);
+    return MakeProcVnode(buf, n);
+}
+
 // /proc/[pid]/cmdline — live NUL-separated arguments, tied to PID incarnation.
 static Vnode* GenPidCmdline(const ProcessSnapshot& proc)
 {
@@ -1636,6 +1666,7 @@ static ProcPidEntry g_pidEntries[] = {
     { "cgroup",  GenPidCgroup },
     { "syscall", GenPidSyscall },
     { "wchan",   GenPidWchan },
+    { "futex",   GenPidFutex },
 };
 static constexpr uint32_t NUM_PID_ENTRIES = sizeof(g_pidEntries) / sizeof(g_pidEntries[0]);
 

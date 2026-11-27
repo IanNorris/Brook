@@ -15,6 +15,13 @@ struct FutexWaitvEntry {
 static_assert(sizeof(FutexWaitvEntry) == 24, "struct futex_waitv is 24 bytes");
 
 static constexpr uint32_t FUTEX_WAITV_MAX = 128;
+
+// /proc/<pid>/futex row (see FutexSnapshotTask).
+struct FutexTaskSnapshot {
+    uint64_t userAddress, owner, key;
+    uint32_t tid, expected, current;
+    bool multi;
+};
 static constexpr uint32_t FUTEX2_SIZE_U8 = 0x00;
 static constexpr uint32_t FUTEX2_SIZE_U16 = 0x01;
 static constexpr uint32_t FUTEX2_SIZE_U32 = 0x02;
