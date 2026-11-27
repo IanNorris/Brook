@@ -178,7 +178,7 @@ static void surface_unmap(struct brook_surface *s) {
     scene_owner_unref(s->scene);s->scene=NULL;s->scene_disabled=0;
     if (s->wm_id) wm_destroy_window(s->wm_id);
     s->idle_inhibit_sent=0; /* the kernel drops the count with the window */
-    s->wm_id=0;s->vfb=NULL;s->vfb_w=s->vfb_h=s->vfb_stride=0;s->deco_sent_mode=-1;
+    s->wm_id=0;s->native_focused=0;s->vfb=NULL;s->vfb_w=s->vfb_h=s->vfb_stride=0;s->deco_sent_mode=-1;
     s->strip_due=3;s->strip_trailing=0;s->strip_style=0;strip_retry_drop(s);
 }
 static int surface_window(struct brook_surface *s,struct brook_view *view) {
