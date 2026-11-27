@@ -14,7 +14,24 @@ static long test_syscall(long number, ...);
 #undef main
 #undef syscall
 
+static unsigned test_outputs;
+static uint64_t test_output_generation;
 static long test_syscall(long number, ...) {
+    if (number == BROOK_SYS_WM_GET_OUTPUTS) {
+        va_list args;
+        va_start(args, number);
+        struct brook_outputs_header *header = (void *)(uintptr_t)va_arg(args, long);
+        struct brook_output_desc *out = (void *)(uintptr_t)va_arg(args, long);
+        long capacity = va_arg(args, long);
+        va_end(args);
+        const struct brook_output_desc heads[2] = {
+            {0, 0, 0, 3840, 2160, 60000, 100, BROOK_OUTPUT_CONNECTED | BROOK_OUTPUT_ENABLED | BROOK_OUTPUT_PRIMARY, "BROOK-1"},
+            {1, 3840, 0, 2560, 1440, 60000, 100, BROOK_OUTPUT_CONNECTED | BROOK_OUTPUT_ENABLED, "BROOK-2"}};
+        header->count = test_outputs; header->generation = test_output_generation;
+        long n = capacity < (long)test_outputs ? capacity : (long)test_outputs;
+        for (long i = 0; i < n; ++i) out[i] = heads[i];
+        return n;
+    }
     if (number != BROOK_SYS_WM_GET_SCREEN_INFO) return 0;
     ++screen_queries;
     if (screen_error) return -1;
@@ -137,11 +154,50 @@ static void check_client(unsigned version, unsigned x11) {
     close(sockets[1]); close(late[1]); wl_display_destroy(display);
 }
 
+/* A second head (desktop x=3840) becomes a wl_output only Xwayland sees, at
+ * its desktop position: the X root then covers it, so X windows there take
+ * input. Native clients keep the single primary output. */
+static void check_second_head(void) {
+    int xs[2], ns[2];
+    assert(!socketpair(AF_UNIX, SOCK_STREAM, 0, xs) && !socketpair(AF_UNIX, SOCK_STREAM, 0, ns));
+    struct wl_display *display = wl_display_create(); assert(display);
+    g_display = display;
+    struct wl_client *x = wl_client_create(display, xs[0]), *native = wl_client_create(display, ns[0]);
+    assert(x && native && xwayland_attach_client(x));
+    test_outputs = 2; ++test_output_generation;
+    assert(output_sync_extra() && g_xoutputs[1].global && !g_xoutputs[2].global);
+    assert(!output_sync_extra()); /* same generation: nothing to do */
+    assert(output_global_xwayland_only(g_xoutputs[1].global));
+    assert(xwayland_global_filter(x, g_xoutputs[1].global, NULL));
+    assert(!xwayland_global_filter(native, g_xoutputs[1].global, NULL));
+    output_bind_extra(x, (void *)(uintptr_t)1, 4, 0);
+    assert(g_outputs && g_outputs->index == 1);
+    wl_display_flush_clients(display);
+    uint32_t wire[512]; ssize_t bytes = recv(xs[1], wire, sizeof(wire), MSG_DONTWAIT);
+    assert(bytes > 0);
+    int geometry = 0, mode = 0, name = 0;
+    for (size_t offset = 0; offset < (size_t)bytes;) {
+        uint32_t *event = (void *)((char *)wire + offset);
+        uint32_t size = event[1] >> 16, opcode = event[1] & 65535;
+        if (opcode == WL_OUTPUT_GEOMETRY) geometry = (int32_t)event[2] == 3840 && event[3] == 0;
+        if (opcode == WL_OUTPUT_MODE) mode = event[3] == 2560 && event[4] == 1440;
+        if (opcode == WL_OUTPUT_NAME) name = !strcmp((char *)&event[3], "BROOK-2");
+        offset += size;
+    }
+    assert(geometry && mode && name);
+    test_outputs = 1; ++test_output_generation;
+    assert(output_sync_extra() && !g_xoutputs[1].global && g_outputs->index == 0);
+    wl_client_destroy(x); wl_client_destroy(native);
+    close(xs[1]); close(ns[1]); wl_display_destroy(display);
+    g_display = NULL; test_outputs = 0;
+}
+
 int main(void) {
+    check_second_head();
     for (g_output_scale = 1; g_output_scale <= 2; ++g_output_scale)
         for (unsigned x11 = 0; x11 <= 1; ++x11)
             for (unsigned version = 1; version <= 4; ++version)
                 check_client(version, x11);
-    puts("OUTPUT_IDENTITY_PASS live size updates, 1x/2x, v1/v2/v3/v4, Wayland and Xwayland");
+    puts("OUTPUT_IDENTITY_PASS live size updates, 1x/2x, v1/v2/v3/v4, Wayland and Xwayland, second head for Xwayland only");
     return 0;
 }

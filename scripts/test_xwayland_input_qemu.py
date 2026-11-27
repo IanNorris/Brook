@@ -110,9 +110,19 @@ def main():
     parser.add_argument('--kernel', type=Path, help='replace KERNEL/BROOK.ELF in the copied set')
     parser.add_argument('--accel', choices=('kvm', 'tcg'), default='kvm')
     parser.add_argument('--dialog-delay', type=int, default=45)
+    parser.add_argument('--test-output', metavar='WxH+X+Y',
+                        help="waylandd's test-only virtual second output for Xwayland (/etc/waylandd-test-output)")
+    parser.add_argument('--trace', action='store_true', help='/etc/xwayland-input-trace (waylandd and brook-xwm input tracing)')
+    parser.add_argument('--popups', type=int, default=0,
+                        help='the probe first maps and destroys this many tiny override-redirect popups')
     args = parser.parse_args()
     args.output.mkdir(mode=0o700, parents=True)
-    args.files = prepare_files(args)
+    extra = []
+    if args.test_output:
+        extra.append(('ETC/waylandd-test-output', args.test_output.encode() + b'\n'))
+    if args.trace:
+        extra.append(('ETC/xwayland-input-trace', b'1\n'))
+    args.files = prepare_files(args, extra)
     fixture.adopt_prebuilt(args.files)
     system, fallback = fixture.make_disks(args)
     result = {'waylandd': str(args.waylandd) if args.waylandd else 'set',
@@ -129,7 +139,8 @@ def main():
         probe_id = uuid.uuid4().hex
         job = guest.call('hw_guest_run', request_id=probe_id, uid=1000, cwd='/tmp',
                          env={'DISPLAY': ':0', 'HOME': '/data/home'},
-                         argv=['/boot/bin/XPROBE', '--seconds', '170', '--dialog-delay', str(args.dialog_delay)],
+                         argv=['/boot/bin/XPROBE', '--seconds', '170', '--dialog-delay', str(args.dialog_delay),
+                               '--popups', str(args.popups)],
                          wait_s=2)
         result['probe_job'] = job.get('state')
 
@@ -187,6 +198,13 @@ def main():
                      for t, r in windows().items()}
             return [px, py, state]
 
+        if args.popups:  # let the popup storm finish before the input steps
+            deadline = time.monotonic() + 300
+            while time.monotonic() < deadline:
+                time.sleep(3)
+                seen = guest.call('hw_job', operation_id=probe_id, wait_s=0, output_limit=16384)
+                if 'POPUPS' in seen.get('stdout', {}).get('text', ''):
+                    break
         rows = wait_windows(PROBE_TITLES[:2])
         result['windows_initial'] = {t: window_rect(r, 'client') for t, r in rows.items()}
         steps = []
@@ -213,6 +231,12 @@ def main():
             shot = args.output / f'cursor-{name}.ppm'
             qmp.call('screendump', filename=str(shot))
             result.setdefault('cursor_shots', {})[name] = {'file': shot.name, 'pointer': [px, py]}
+        # Depth-24 window A holds pixels 0x40c04040 (alpha byte 0x40): it must
+        # appear exactly 0xc04040, not blended with the wallpaper.
+        x, y, w, h = window_rect(rows['xwl-probe-a'], 'client')
+        samples = [ppm_pixel(args.output / 'cursor-xwl-probe-b.ppm', x + 10 + i * 7, y + h - 12) for i in range(4)]
+        result['depth24_alpha'] = {'samples': [f'{v:06x}' for v in samples],
+                                   'ok': all(v == 0xc04040 for v in samples)}
         write()
         out, err, deadline = '', '', time.monotonic() + 240
         while True:
@@ -254,8 +278,24 @@ def main():
         guest.stop()
         for disk in (system, fallback):
             disk.unlink(missing_ok=True)
-    print(json.dumps({k: result.get(k) for k in ('input_ok', 'input', 'cursor', 'depth24_alpha')}, indent=1))
-    if not (result.get('input_ok') and result.get('cursor', {}).get('ok') and result.get('depth24_alpha', {}).get('ok')):
+    serial = (args.output / 'run' / 'serial.log').read_text(errors='replace')
+    probe_out = (args.output / 'probe.out').read_text() if (args.output / 'probe.out').exists() else ''
+    root = next((line.split()[1] for line in probe_out.splitlines() if line.startswith('ROOT ')), None)
+    result['x_root'] = root
+    if args.test_output:
+        w, rest = args.test_output.split('x', 1)
+        h, x = rest.split('+')[0], rest.split('+')[1]
+        result['x_root_expected'] = f'{3840 + int(w) if int(x) == 3840 else None}x{max(2160, int(h))}'
+        result['x_root_ok'] = root == result['x_root_expected']
+    result['trace_lines'] = [l for l in serial.splitlines() if '] trace' in l][:40]
+    result['xwayland'] = {
+        'retired': [l for l in serial.splitlines() if 'generation retired' in l or "Wayland connection closed" in l],
+        'dropped': [l for l in serial.splitlines() if 'dropped:' in l][:20],
+        'popups_done': 'POPUPS' in (args.output / 'probe.out').read_text() if (args.output / 'probe.out').exists() else None}
+    write()
+    print(json.dumps({k: result.get(k) for k in ('input_ok', 'input', 'cursor', 'depth24_alpha', 'xwayland', 'x_root', 'x_root_ok')}, indent=1))
+    if result['xwayland']['retired'] or result.get('x_root_ok') is False or not (result.get('input_ok') and result.get('cursor', {}).get('ok') and
+                                             result.get('depth24_alpha', {}).get('ok')):
         raise SystemExit('XWAYLAND_INPUT_QEMU_FAIL')
     print('XWAYLAND_INPUT_QEMU_PASS')
     print(args.output / 'verdict.json')

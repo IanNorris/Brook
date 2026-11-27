@@ -23,11 +23,30 @@ struct brook_xwindow {
     /* The X client's PID (BXWM_CLIENT_PID) and the native window it was last
      * reported to the kernel for (launch feedback: "Starting: <app>"). */
     uint32_t client_pid,client_pid_wm;
+    /* A failure confined to this window (its native window is gone or was
+     * refused) drops only this window: drop_reason is handled in
+     * xwayland_pump, and the X window is not paired again until it is mapped
+     * with a new surface serial. */
+    const char *drop_reason;int drop_line,drop_errno;
+    uint64_t dropped_serial;
 };
 static struct brook_xwindow *g_xwindows;
+/* Generation-wide failures (the helper stream, a child, the protocol) retire
+ * every X client; log why. */
+static const char *g_xwm_fail_reason;static int g_xwm_fail_line,g_xwm_fail_errno;
+static int g_xwm_failed;
+#define XWM_FAIL(why) xwm_fail(why,__LINE__)
+static void xwm_fail(const char *why,int line) {
+    if (!g_xwm_failed) { g_xwm_fail_reason=why;g_xwm_fail_line=line;g_xwm_fail_errno=errno; }
+    g_xwm_failed=1;
+}
+#define XWM_DROP(w,why) xwm_drop(w,why,__LINE__)
+static void xwm_drop(struct brook_xwindow *w,const char *why,int line) {
+    if (w && !w->drop_reason) { w->drop_reason=why;w->drop_line=line;w->drop_errno=errno; }
+}
 static struct bxwm_stream g_xwm_stream;
 static struct wl_event_source *g_xwm_source;
-static int g_xwm_fd=-1,g_xwm_failed,g_xwm_retiring,g_xwm_ready;
+static int g_xwm_fd=-1,g_xwm_retiring,g_xwm_ready;
 static pid_t g_xwayland_pid,g_xwm_pid;
 static uint32_t g_xwm_last_sync;
 static uint32_t g_xwm_started_ms;
@@ -151,12 +170,12 @@ static int xwayland_send(struct brook_xwindow *w,uint32_t type,const BrookWindow
         xw_to_x(w,geometry->client_x,geometry->client_y,&message.x,&message.y);
         message.width=geometry->width/scale?geometry->width/scale:1;
         message.height=geometry->height/scale?geometry->height/scale:1;
-        if (w->native_sequence==UINT64_MAX) { g_xwm_failed=1;return 0; }
+        if (w->native_sequence==UINT64_MAX) { XWM_FAIL("configure serial overflow");return 0; }
         message.configure_serial=++w->native_sequence;
     }
     if (!bxwm_valid(&message,g_xwayland_generation,0) ||
         !bxwm_enqueue(&g_xwm_stream,&message) || bxwm_flush(g_xwm_fd,&g_xwm_stream)<0) {
-        g_xwm_failed=1;return 0;
+        XWM_FAIL("command to helper");return 0;
     }
     if (g_xwm_source) wl_event_source_fd_update(g_xwm_source,WL_EVENT_READABLE|
         (g_xwm_stream.count?WL_EVENT_WRITABLE:0));
@@ -169,7 +188,8 @@ static void xwayland_report_client_pid(struct brook_xwindow *w) {
     struct brook_surface *s=w->surface;
     if (!s || !s->wm_id || !w->client_pid || w->client_pid_wm==s->wm_id) return;
     w->client_pid_wm=s->wm_id;
-    if (syscall(BROOK_SYS_WM_SET_CONTENT_PROCESS,(long)s->wm_id,(long)w->client_pid,0L,0L,0L,0L)<0 && errno!=ESRCH)
+    if (syscall(BROOK_SYS_WM_SET_CONTENT_PROCESS,(long)s->wm_id,(long)w->client_pid,0L,0L,0L,0L)<0 &&
+        errno!=ESRCH && errno!=ENOSYS)
         fprintf(stderr,"[waylandd] X client pid %u for wm=%u: %s\n",w->client_pid,s->wm_id,strerror(errno));
 }
 static void xwayland_native_sync(struct brook_surface *s,int initial) {
@@ -178,7 +198,7 @@ static void xwayland_native_sync(struct brook_surface *s,int initial) {
     if (syscall(BROOK_SYS_WM_WINDOW_STATE,(long)s->wm_id,
         (long)(w->native_valid?w->native.incarnation:0),(long)&geometry,(long)sizeof(geometry),0L,0L)<0 ||
         geometry.version!=BROOK_WINDOW_STATE_VERSION || !geometry.incarnation) {
-        g_xwm_failed=1;return;
+        XWM_DROP(w,"native window state");return;
     }
     const uint32_t scale=xw_scale(w);
     if (scale>1 && (geometry.width%scale || geometry.height%scale)) {
@@ -187,7 +207,7 @@ static void xwayland_native_sync(struct brook_surface *s,int initial) {
         struct brook_wm_create_out out={0};
         if (!width) width=scale;
         if (!height) height=scale;
-        if (wm_resize_vfb(s->wm_id,width,height,&out) || !out.vfb_user) { g_xwm_failed=1;return; }
+        if (wm_resize_vfb(s->wm_id,width,height,&out) || !out.vfb_user) { XWM_DROP(w,"scaled resize");return; }
         s->vfb=(uint32_t *)(uintptr_t)out.vfb_user;s->vfb_stride=out.vfb_stride;
         s->vfb_w=geometry.width=width;s->vfb_h=geometry.height=height;
     }
@@ -207,7 +227,7 @@ static void xwayland_native_sync(struct brook_surface *s,int initial) {
                 if (y<80) y=80;
             }
             if (syscall(BROOK_SYS_WM_PLACE_WINDOW,(long)s->wm_id,(long)geometry.incarnation,
-                (long)x,(long)y,0L,0L)<0) { g_xwm_failed=1;return; }
+                (long)x,(long)y,0L,0L)<0) { XWM_DROP(w,"initial placement");return; }
             geometry.client_x=x;geometry.client_y=y;
         }
     }
@@ -247,7 +267,7 @@ static void xwayland_apply_fullscreen(struct brook_xwindow *w) {
         w->fullscreen=w->kernel_fullscreen=1;xwayland_native_sync(s,0);return;
     }
     if (!w->want_fullscreen && w->kernel_fullscreen) {
-        if (wm_set_fullscreen(id,0)<0) { g_xwm_failed=1;return; }
+        if (wm_set_fullscreen(id,0)<0) { XWM_DROP(w,"leave fullscreen");return; }
         w->fullscreen=w->kernel_fullscreen=0;xwayland_native_sync(s,0);return;
     }
     if (w->want_fullscreen) {
@@ -261,21 +281,21 @@ static void xwayland_apply_fullscreen(struct brook_xwindow *w) {
             (void)wm_set_maximized(id,0);
             BrookWindowState restored={0};
             if (syscall(BROOK_SYS_WM_WINDOW_STATE,(long)id,(long)w->native.incarnation,(long)&restored,
-                (long)sizeof(restored),0L,0L)<0 || restored.version!=BROOK_WINDOW_STATE_VERSION) { g_xwm_failed=1;return; }
+                (long)sizeof(restored),0L,0L)<0 || restored.version!=BROOK_WINDOW_STATE_VERSION) { XWM_DROP(w,"fullscreen restore state");return; }
             w->native=restored;w->saved_maximized=1;
         } else w->saved_maximized=0;
         w->saved_x=w->native.client_x;w->saved_y=w->native.client_y;
         w->saved_width=w->native.width;w->saved_height=w->native.height;
         if (wm_set_decoration_mode(id,1,0,0,0)<0 ||
             syscall(BROOK_SYS_WM_PLACE_WINDOW,(long)id,(long)w->native.incarnation,0L,0L,0L,0L)<0 ||
-            !xwayland_resize_native(w,width,height)) { g_xwm_failed=1;return; }
+            !xwayland_resize_native(w,width,height)) { XWM_DROP(w,"enter fullscreen");return; }
         w->fullscreen=1;
     } else {
         w->fullscreen=0;
         if (wm_set_decoration_mode(id,(w->state.flags&BXWM_CLIENT_CHROME)!=0,0,0,0)<0 ||
             !xwayland_resize_native(w,w->saved_width,w->saved_height) ||
             syscall(BROOK_SYS_WM_PLACE_WINDOW,(long)id,(long)w->native.incarnation,
-                (long)w->saved_x,(long)w->saved_y,0L,0L)<0) { g_xwm_failed=1;return; }
+                (long)w->saved_x,(long)w->saved_y,0L,0L)<0) { XWM_DROP(w,"leave fallback fullscreen");return; }
         if (w->saved_maximized) (void)wm_set_maximized(id,1);
     }
     xwayland_native_sync(s,0);
@@ -298,7 +318,7 @@ static void xwayland_apply_client_geometry(struct brook_xwindow *w,const struct 
     int32_t x,y;xw_to_native(w,message->x,message->y,&x,&y);
     if (x!=w->native.client_x || y!=w->native.client_y) {
         if (syscall(BROOK_SYS_WM_PLACE_WINDOW,(long)s->wm_id,(long)w->native.incarnation,
-            (long)x,(long)y,0L,0L)<0) { g_xwm_failed=1;return; }
+            (long)x,(long)y,0L,0L)<0) { XWM_DROP(w,"client move");return; }
         w->native.client_x=x;w->native.client_y=y;
     }
     const uint64_t scale=xw_scale(w);
@@ -307,7 +327,7 @@ static void xwayland_apply_client_geometry(struct brook_xwindow *w,const struct 
     if (width!=w->native.width || height!=w->native.height) {
         struct brook_wm_create_out out={0};
         if (wm_resize_vfb(s->wm_id,(uint32_t)width,(uint32_t)height,&out) || !out.vfb_user) {
-            g_xwm_failed=1;return;
+            XWM_DROP(w,"client resize");return;
         }
         s->vfb=(uint32_t *)(uintptr_t)out.vfb_user;s->vfb_stride=out.vfb_stride;
         s->vfb_w=(uint32_t)width;s->vfb_h=(uint32_t)height;
@@ -319,14 +339,15 @@ static void xwayland_pair_surfaces(void) {
     if (!g_xwayland_client || g_xwm_failed) return;
     for (struct brook_xwindow *w=g_xwindows;w;w=w->next) {
         if (!(w->state.flags&BXWM_MAPPED) || !w->state.serial) { xwayland_unpair(w);continue; }
+        if (w->dropped_serial==w->state.serial || w->drop_reason) continue;
         struct brook_surface *s=xwayland_surface_by_serial(g_xwayland_generation,w->state.serial);
         if (!s) continue;
         if (w->surface && w->surface!=s) xwayland_unpair(w);
-        if (s->xwindow && s->xwindow!=w) { g_xwm_failed=1;return; }
+        if (s->xwindow && s->xwindow!=w) { XWM_DROP(w,"surface already paired");continue; }
         if (!w->surface) {
             w->surface=s;s->xwindow=w;w->native_valid=0;w->initial_placement=0;
             snprintf(s->title,sizeof(s->title),"%s",w->state.title[0]?w->state.title:"X11 application");
-            if (!surface_repaint(s)) g_xwm_failed=1;
+            if (!surface_repaint(s)) XWM_DROP(w,"native window");
         }
     }
 }
@@ -387,10 +408,9 @@ static int xwayland_accept_message(const struct bxwm_message *message) {
     w->state=*message;
     if (w->surface && w->surface->wm_id && !w->fullscreen &&
         ((old_flags^message->flags)&BXWM_CLIENT_CHROME) && !(message->flags&BXWM_OVERRIDE)) {
-        if (wm_set_decoration_mode(w->surface->wm_id,(message->flags&BXWM_CLIENT_CHROME)!=0,0,0,0)<0) {
-            g_xwm_failed=1;return 0;
-        }
-        xwayland_native_sync(w->surface,0);
+        if (wm_set_decoration_mode(w->surface->wm_id,(message->flags&BXWM_CLIENT_CHROME)!=0,0,0,0)<0)
+            XWM_DROP(w,"decoration mode");
+        else xwayland_native_sync(w->surface,0);
     }
     if (w->surface && strcmp(w->surface->title,message->title)) {
         snprintf(w->surface->title,sizeof(w->surface->title),"%s",message->title);
@@ -398,19 +418,23 @@ static int xwayland_accept_message(const struct bxwm_message *message) {
     }
     xwayland_pair_surfaces();
     if (w->surface && (!w->surface->wm_id || w->target_width))
-        if (!surface_repaint(w->surface)) g_xwm_failed=1;
+        if (!surface_repaint(w->surface)) XWM_DROP(w,"native window repaint");
     return !g_xwm_failed;
 }
 static int xwayland_control_ready(int fd,uint32_t mask,void *data) {
     (void)data;
-    if (mask&(WL_EVENT_HANGUP|WL_EVENT_ERROR)) { g_xwm_failed=1;return 0; }
+    if (mask&(WL_EVENT_HANGUP|WL_EVENT_ERROR)) { XWM_FAIL("helper stream hangup");return 0; }
     if (mask&WL_EVENT_READABLE) {
         struct bxwm_message message;int result=0;unsigned work=0;
         while (work++<64 && (result=bxwm_receive(fd,&g_xwm_stream,&message))>0)
-            if (!xwayland_accept_message(&message)) { g_xwm_failed=1;break; }
-        if (result<0) g_xwm_failed=1;
+            if (!xwayland_accept_message(&message)) {
+                fprintf(stderr,"[waylandd] XWM message rejected type=%u window=0x%x %ux%u%+d%+d flags=0x%x\n",
+                        message.type,message.window,message.width,message.height,message.x,message.y,message.flags);
+                XWM_FAIL("helper message");break;
+            }
+        if (result<0) XWM_FAIL("helper stream read");
     }
-    if (bxwm_flush(fd,&g_xwm_stream)<0) g_xwm_failed=1;
+    if (bxwm_flush(fd,&g_xwm_stream)<0) XWM_FAIL("helper stream write");
     if (g_xwm_source) wl_event_source_fd_update(g_xwm_source,WL_EVENT_READABLE|
         (g_xwm_stream.count?WL_EVENT_WRITABLE:0));
     return 0;
@@ -429,8 +453,15 @@ static void xwayland_focus_reconciled(struct brook_surface *s) {
 }
 static void xwayland_reap(pid_t *pid) {
     if (*pid<=0) return;
-    int status;pid_t done=waitpid(*pid,&status,WNOHANG);
-    if (done==*pid || (done<0 && errno==ECHILD)) { *pid=0;if (g_xwm_fd>=0) g_xwm_failed=1; }
+    int status=0;pid_t done=waitpid(*pid,&status,WNOHANG);
+    if (done==*pid || (done<0 && errno==ECHILD)) {
+        const pid_t reaped=*pid;*pid=0;
+        if (g_xwm_fd>=0) {
+            fprintf(stderr,"[waylandd] %s pid %d exited status=0x%x\n",pid==&g_xwm_pid?"XWM":"Xwayland",
+                    (int)reaped,done>0?status:-1);
+            XWM_FAIL("Xwayland or XWM process exited");
+        }
+    }
 }
 static int xwayland_shutdown(void) {
     // Final teardown has no subsequent event-loop pump. Prevent a replacement
@@ -456,6 +487,15 @@ static int xwayland_shutdown(void) {
     }
     return 1;
 }
+/* Windows whose own native operation failed: unpair just them. */
+static void xwayland_process_drops(void) {
+    for (struct brook_xwindow *w=g_xwindows;w;w=w->next) {
+        if (!w->drop_reason) continue;
+        fprintf(stderr,"[waylandd] X window 0x%x dropped: %s (line %d, errno %d); the generation continues\n",
+                w->state.window,w->drop_reason,w->drop_line,w->drop_errno);
+        w->dropped_serial=w->state.serial;w->drop_reason=NULL;xwayland_unpair(w);
+    }
+}
 static void xwayland_pump(void) {
     xwayland_reap(&g_xwayland_pid);xwayland_reap(&g_xwm_pid);
     if(g_xretire_active) {
@@ -477,15 +517,18 @@ static void xwayland_pump(void) {
             if (newline) {
                 *newline=0;
                 if (!*g_xdisplay_reply || strspn(g_xdisplay_reply,"0123456789")!=strlen(g_xdisplay_reply) ||
-                    atoi(g_xdisplay_reply)!=g_xdisplay_number) g_xwm_failed=1;
+                    atoi(g_xdisplay_reply)!=g_xdisplay_number) XWM_FAIL("display number");
                 else g_xdisplay_ready=1;
                 close(g_xdisplay_fd);g_xdisplay_fd=-1;
-            } else if (g_xdisplay_received==sizeof(g_xdisplay_reply)-1) g_xwm_failed=1;
-        } else if (!n || (errno!=EINTR && errno!=EAGAIN && errno!=EWOULDBLOCK)) g_xwm_failed=1;
+            } else if (g_xdisplay_received==sizeof(g_xdisplay_reply)-1) XWM_FAIL("display reply length");
+        } else if (!n || (errno!=EINTR && errno!=EAGAIN && errno!=EWOULDBLOCK)) XWM_FAIL("display reply read");
     }
-    if (g_xwm_fd>=0 && (!g_xwm_ready || !g_xdisplay_ready) && (uint32_t)(g_now_ms()-g_xwm_started_ms)>15000) g_xwm_failed=1;
+    if (g_xwm_fd>=0 && (!g_xwm_ready || !g_xdisplay_ready) && (uint32_t)(g_now_ms()-g_xwm_started_ms)>15000) XWM_FAIL("startup timeout");
+    xwayland_process_drops();
     if (g_xwm_failed) {
-        fprintf(stderr,"[waylandd] owned Xwayland generation retired after connection failure\n");
+        fprintf(stderr,"[waylandd] owned Xwayland generation retired: %s (line %d, errno %d)\n",
+                g_xwm_fail_reason?g_xwm_fail_reason:"unknown",g_xwm_fail_line,g_xwm_fail_errno);
+        g_xwm_fail_reason=NULL;
         xwayland_generation_lost();g_xwm_failed=0;return;
     }
     uint32_t now=g_now_ms();
@@ -572,6 +615,7 @@ static int xwayland_start(const char *server,const char *helper,const char *disp
         // separate opt-in, so an older helper keeps protocol 2).
         if (setenv("BROOK_XWM_PROTOCOL","2",1) || setenv("BROOK_XWM_SCALE",scale,1) ||
             setenv("BROOK_XWM_CLIENT_PID","1",1)) _exit(126);
+        if (g_input_trace && setenv("BROOK_XWM_TRACE","1",1)) _exit(126);
         execl(helper,helper,wm_fd,control_fd,generation,(char *)NULL);_exit(127);
     }
     g_xwm_pid=child;
@@ -583,6 +627,6 @@ fail:
         if (control[i]>=0) close(control[i]);
         if (display_pipe[i]>=0) close(display_pipe[i]);
     }
-    g_xwm_failed=1;xwayland_generation_lost();return 0;
+    XWM_FAIL("start");xwayland_generation_lost();return 0;
 }
 #endif

@@ -35,9 +35,11 @@ static double now_s(void) {
 
 int main(int argc, char **argv) {
     double seconds = 120, dialog_delay = 8;
+    int popups = 0;
     for (int i = 1; i + 1 < argc; i += 2) {
         if (!strcmp(argv[i], "--seconds")) seconds = atof(argv[i + 1]);
         else if (!strcmp(argv[i], "--dialog-delay")) dialog_delay = atof(argv[i + 1]);
+        else if (!strcmp(argv[i], "--popups")) popups = atoi(argv[i + 1]);
     }
     Display *d = NULL;
     for (int tries = 0; !d && tries < 60; ++tries) {  /* the owned Xwayland may still be starting */
@@ -76,7 +78,43 @@ int main(int argc, char **argv) {
     XMapWindow(d, w[2].id);
     XFlush(d);
     for (int i = 0; i < 3; ++i) printf("WIN %s 0x%lx\n", w[i].name, w[i].id);
+    printf("ROOT %dx%d\n", DisplayWidth(d, screen), DisplayHeight(d, screen));
     fflush(stdout);
+    /* --popups N: Steam-like override-redirect popups, mapped at 4x2, then
+     * grown and moved, or destroyed at once, N times in quick succession. */
+    for (int i = 0; i < popups; ++i) {
+        XSetWindowAttributes a = {0};
+        a.override_redirect = True; a.background_pixel = 0xe0e0e0;
+        Window popup = XCreateWindow(d, root, 300 + (i % 7) * 40, 220 + (i % 5) * 30, 4, 2, 0, CopyFromParent,
+                                     InputOutput, CopyFromParent, CWOverrideRedirect | CWBackPixel, &a);
+        XMapWindow(d, popup); XFlush(d);
+        struct timespec pause = {0, (i % 3) * 20000000L}; nanosleep(&pause, NULL);
+        if (i % 4) { XMoveResizeWindow(d, popup, 260 + (i % 9) * 30, 200, 264, 330); XFlush(d); }
+        pause.tv_nsec = (i % 2) ? 150000000L : 5000000L; nanosleep(&pause, NULL);
+        if (i % 5 == 0) { XUnmapWindow(d, popup); XFlush(d); }
+        XDestroyWindow(d, popup); XFlush(d);
+        while (XPending(d)) { XEvent e; XNextEvent(d, &e); }
+    }
+    /* Then one popup reused the way toolkits keep a menu window: remapped
+     * with new contents, size and position (also past x=3840), unmapped. */
+    if (popups) {
+        XSetWindowAttributes a = {0};
+        a.override_redirect = True; a.background_pixel = 0xd0d0f0;
+        Window menu = XCreateWindow(d, root, 2920, 298, 4, 2, 0, CopyFromParent, InputOutput, CopyFromParent,
+                                    CWOverrideRedirect | CWBackPixel, &a);
+        for (int i = 0; i < popups; ++i) {
+            if (i % 3 == 0) XMoveResizeWindow(d, menu, 2920, 298, 4, 2);
+            XMapWindow(d, menu); XFlush(d);
+            struct timespec pause = {0, (i % 4) * 15000000L}; nanosleep(&pause, NULL);
+            XMoveResizeWindow(d, menu, (i % 2) ? 3700 + (i % 6) * 60 : 400 + i % 300, 300 + i % 200, 240 + i % 50, 300);
+            XFlush(d);
+            pause.tv_nsec = (i % 2) ? 60000000L : 2000000L; nanosleep(&pause, NULL);
+            XUnmapWindow(d, menu); XFlush(d);
+            while (XPending(d)) { XEvent e; XNextEvent(d, &e); }
+        }
+        XDestroyWindow(d, menu); XFlush(d);
+        printf("POPUPS %d done\n", popups); fflush(stdout);
+    }
     const double start = now_s();
     int dialog_mapped = 0;
     while (now_s() - start < seconds) {

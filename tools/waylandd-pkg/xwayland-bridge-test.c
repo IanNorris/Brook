@@ -187,9 +187,17 @@ int main(int argc,char **argv) {
     assert(xwayland_accept_message(&pid_message) && content_reports==1 && content_window==id && content_pid==4321);
     assert(xwayland_accept_message(&pid_message) && content_reports==1);
     pid_message.x=0;assert(!bxwm_valid(&pid_message,g_xwayland_generation,1));
+    // A failure confined to one window (its native window went stale, as a
+    // short-lived Steam popup's can) drops that window only: the generation
+    // and the other X window survive, and the same map is not paired again.
+    const uint32_t menu_wm=popup->wm_id;native[menu_wm].incarnation+=50;
+    xwayland_native_sync(popup,0);assert(!g_xwm_failed);
+    xwayland_process_drops();assert(!g_xwm_failed && !popup->xwindow && !popup->wm_id && s->wm_id==id && s->xwindow);
+    xwayland_pair_surfaces();assert(!popup->xwindow);
+    native[menu_wm].incarnation-=50;
     struct bxwm_message dead=state;dead.type=BXWM_DESTROY;dead.identity=999;
     assert(xwayland_accept_message(&dead) && s->wm_id==id);
-    state.flags=0;assert(xwayland_accept_message(&state));assert(!s->wm_id && destroyed==2);
+    state.flags=0;assert(xwayland_accept_message(&state));assert(!s->wm_id && destroyed==3);
     wl_resource_destroy(s->resource);
     // Keep a mapped native toplevel, not just an unconfigured wl_surface,
     // through retirement. Its window identity and retained pixels must stay.
