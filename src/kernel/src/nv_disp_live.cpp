@@ -666,7 +666,14 @@ bool Presenter1OnLocked(){
     }
     auto& f=g_driver.f[1];
     if(!MapPresenter(p,f,g_driver.HeadOneThird(f.surf[0]))){KPrintf("nv-display: head 1 BAR1 mapping failed\n");(void)g_driver.Down1();return false;}
-    p.age.Stale(0);   // C holds the bring-up test pattern, not a desktop frame
+    // C holds the bring-up test pattern and the others uninitialised VRAM; until the desktop's
+    // first head-1 present (after /nix mounts: seconds, or a long boot-time e2fsck) head 1 would
+    // show them (27 Nov: "full-screen corruption on the second monitor during the disk repair").
+    // Clear every head-1 buffer to black first. The age repair still treats them as stale.
+    {const uint64_t px=uint64_t(p.pitchPx)*p.height;
+     for(uint32_t b=0;b<3;++b)if(p.px[b])for(uint64_t i=0;i<px;++i)p.px[b][i]=0xff000000u;
+     __asm__ volatile("sfence":::"memory");}
+    p.age.Stale(0);   // C held the bring-up test pattern, not a desktop frame
     p.active=true;g_driver.out1External=true;
     KPrintf("nv-display: head 1 presents by flipping (%u buffers) as output 2 at x=%u\n",p.nbuf,g_presenter[0].width);
     return true;
