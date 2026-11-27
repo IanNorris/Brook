@@ -51,6 +51,7 @@
 // Single-NIC, single-threaded receive path.
 
 #include "net.h"
+#include "inject_parse.h"
 #include "tcp_info.h"
 #include "arp_neighbor.h"
 #include "arp_probe_tracker.h"
@@ -6564,6 +6565,8 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "Input injection:\n"
             "  inject click X Y      - click at absolute coords\n"
             "  inject move X Y       - move cursor without clicking\n"
+            "  inject button B down|up - mouse button B (0 left, 1 right, 2 middle)\n"
+            "  inject rel DX DY      - relative pointer motion (mouse-look)\n"
             "  inject key SC [ASCII] - press+release scan code (decimal or 0x hex)\n"
             "  inject keydown SC     - press key (no release, for modifiers)\n"
             "  inject keyup SC       - release key\n"
@@ -9130,6 +9133,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         static InputDeviceOps s_debugOps = { "debug_inject", nullptr };
         static bool s_debugRegistered = false;
         static uint8_t s_injectMods = 0; // tracked modifier state for inject
+        static uint8_t s_injectButtons = 0; // held injected mouse buttons (bit 0 left, 1 right, 2 middle)
         if (!s_debugRegistered) {
             s_debugInput.ops = &s_debugOps;
             s_debugInput.head = 0;
@@ -9173,6 +9177,36 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             p += UintToStr(resp + p, y);
             resp[p++] = '\n';
             DebugReplySend( resp, static_cast<uint32_t>(p));
+        }
+
+        // inject button B down|up — press or release mouse button B (0 left, 1 right,
+        // 2 middle) at the current pointer position (games: right click, BG3 camera)
+        else if (StrStartsWith(sub, "button ")) {
+            uint8_t button = 0; bool down = false;
+            if (!InjectParseButton(sub + 7, &button, &down)) { DebugChannelSend("inject: usage: inject button 0|1|2 down|up\n"); return; }
+            if (down) s_injectButtons |= uint8_t(1u << button); else s_injectButtons &= uint8_t(~(1u << button));
+            InputEvent ev = {};
+            ev.type = down ? InputEventType::MouseButtonDown : InputEventType::MouseButtonUp;
+            ev.scanCode = button;
+            ev.modifiers = s_injectButtons;
+            InputDevicePush(&s_debugInput, ev);
+            InputWakeWaiters();
+            DebugChannelSend(down ? "inject: button down\n" : "inject: button up\n");
+        }
+
+        // inject rel DX DY — relative pointer motion (signed), as a USB mouse reports it:
+        // the cursor moves and pointer-locked clients (FPS mouse-look) see raw motion
+        else if (StrStartsWith(sub, "rel ")) {
+            int32_t dx = 0, dy = 0;
+            if (!InjectParseRel(sub + 4, &dx, &dy)) { DebugChannelSend("inject: usage: inject rel DX DY (|d| <= 4096)\n"); return; }
+            MouseMoveRelative(dx, dy);
+            InputEvent ev = {};
+            ev.type = InputEventType::MouseRelativeMove;
+            ev.scanCode = s_injectButtons;
+            ev.deltaX = dx; ev.deltaY = dy;
+            InputDevicePush(&s_debugInput, ev);
+            InputWakeWaiters();
+            DebugChannelSend("inject: rel\n");
         }
 
         // inject move X Y — move mouse without clicking

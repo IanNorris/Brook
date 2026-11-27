@@ -1306,3 +1306,7 @@ add_host_test(test_rtx_stick_update
     "${BROOK_ROOT}/src/third_party/monocypher/monocypher.c"
     "${BROOK_ROOT}/src/third_party/monocypher/monocypher-ed25519.c")
 target_include_directories(test_rtx_stick_update PRIVATE "${BROOK_ROOT}/src/third_party/monocypher")
+
+# Debug-channel inject verbs: button / relative-motion argument parsing (net.cpp).
+add_host_test(test_inject_parse)
+target_compile_options(test_inject_parse PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")

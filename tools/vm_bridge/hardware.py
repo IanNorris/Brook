@@ -215,7 +215,8 @@ class Hardware:
     # Synthetic input through the kernel's `inject` debug commands (a registered
     # debug input device, as QEMU input reaches the same compositor queue). Each
     # action is one boot-guarded command; stops at the first refusal.
-    INPUT_TYPES={'move','click','key','keydown','keyup','type','combo','sleep'}
+    INPUT_TYPES={'move','click','key','keydown','keyup','type','combo','sleep','button','rel'}
+    BUTTONS={'left':0,'right':1,'middle':2}
     def input(self,session,actions,**_):
         if not isinstance(actions,list) or not 1<=len(actions)<=64:raise ValueError('actions: 1..64 entries')
         cmds=[]
@@ -228,7 +229,16 @@ class Hardware:
                 if not isinstance(v,int) or isinstance(v,bool) or not lo<=v<=hi:raise ValueError(f'{t}.{k}: integer {lo}..{hi}')
                 return v
             if t in('move','click'):cmds.append(f'inject {t} {num("x",0,16383)} {num("y",0,16383)}')
-            elif t in('key','keydown','keyup'):cmds.append(f'inject {t} {num("scancode",1,0x7f)}')
+            # 0x80..0x89 are Brook's extended keys (arrows, Home/End/Insert/Delete/PgUp/PgDn),
+            # 125/126 the Super keys (input.h).
+            elif t in('key','keydown','keyup'):cmds.append(f'inject {t} {num("scancode",1,0xff)}')
+            elif t=='button':
+                b=a.get('button');act=a.get('action','click')
+                if b not in self.BUTTONS or act not in('down','up','click'):
+                    raise ValueError('button: button left|right|middle, action down|up|click')
+                n=self.BUTTONS[b]
+                cmds+=[f'inject button {n} down',f'inject button {n} up'] if act=='click' else [f'inject button {n} {act}']
+            elif t=='rel':cmds.append(f'inject rel {num("dx",-4096,4096)} {num("dy",-4096,4096)}')
             elif t=='sleep':cmds.append(f'inject sleep {num("ms",1,5000)}')
             elif t=='type':
                 text=a.get('text')

@@ -169,6 +169,16 @@ class HardwareTests(unittest.TestCase):
                                        {'type':'key','scancode':28},{'type':'sleep','ms':5}])
         self.assertEqual(sent,['inject move 10 20','inject type Hi','inject combo ctrl+a','inject key 28'])
         self.assertEqual((r['completed'],r['requested']),(3,5));self.assertFalse(r['results'][-1]['ok'])
+        sent.clear()
+        with patch.object(self.hardware,'session_lock',locked),patch.object(self.hardware,'guest',guest):
+            r=self.hardware.input('s',[{'type':'button','button':'right','action':'click'},{'type':'button','button':'middle','action':'down'},
+                                       {'type':'rel','dx':-25,'dy':40},{'type':'button','button':'middle','action':'up'},
+                                       {'type':'keydown','scancode':0x80}])
+        self.assertEqual(sent,['inject button 1 down','inject button 1 up','inject button 2 down','inject rel -25 40',
+                               'inject button 2 up','inject keydown 128'])
+        for bad in ([{'type':'button','button':'side'}],[{'type':'button','button':'left','action':'hold'}],
+                    [{'type':'rel','dx':5000,'dy':0}],[{'type':'rel','dx':1}],[{'type':'key','scancode':256}]):
+            with self.assertRaises(ValueError):self.hardware.input('s',bad)
         for bad in ([],[{'type':'warp'}],[{'type':'move','x':-1,'y':0}],[{'type':'type','text':'a\nb'}],
                     [{'type':'combo','keys':'a+ctrl'}],[{'type':'click','x':True,'y':1}],[{'type':'sleep','ms':10000}]):
             with self.assertRaises(ValueError):self.hardware.input('s',bad)
