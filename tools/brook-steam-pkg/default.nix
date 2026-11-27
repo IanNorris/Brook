@@ -92,6 +92,9 @@ let
     ln -s ${clientRuntime} "$out/share/brook/steam-client/steamrt64"
     echo steamrt64 > "$out/share/brook/steam-client/.brook-seed-layers"
   '';
+  # Steam's steamrt64/reaper is i386, which Brook cannot run (every native game exited 126);
+  # the launcher puts this native64 build of the public upstream reaper in its place.
+  reaper = import ../reaper-pkg { inherit pkgs; };
   launcher = pkgs.runCommand "brook-steam-launcher-${source.version}" {} ''
     mkdir -p "$out/bin" "$out/libexec"
     install -m644 ${../../scripts/workloads/brook_steam_launcher.py} "$out/libexec/brook-steam.py"
@@ -106,6 +109,7 @@ let
     export BROOK_STEAM_PROVIDER=${provider}
     export BROOK_STEAM_PULSEAUDIO=${pkgs.pulseaudio}/bin/pulseaudio
     export BROOK_STEAM_PACTL=${pkgs.pulseaudio}/bin/pactl
+    export BROOK_STEAM_REAPER=${reaper}/bin/reaper
     exec /nix/profile/bin/brook-run ${pkgs.python3}/bin/python3 $out/libexec/brook-steam.py "\$@"
     EOF
     chmod 755 "$out/bin/brook-steam"

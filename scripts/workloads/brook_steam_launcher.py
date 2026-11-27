@@ -1041,6 +1041,7 @@ class Steam:
             child_env = dict(env, LD_LIBRARY_PATH=':'.join(
                 str(self.client / p) for p in ('hostlibs', 'steamrt64', 'ubuntu12_64')))
             ensure_dumps_dir()
+            install_native_reaper(self.client)
             if self.stop_requested:
                 raise RuntimeError(f'stopped by {self.stop_requested} before the client started')
             self.main = subprocess.Popen(command, env=child_env, stdin=subprocess.DEVNULL, stdout=output,
@@ -1072,6 +1073,32 @@ class Steam:
             log('stopped', reason=reason, exit=code, cleanup_s=round(time.monotonic() - started, 1),
                 leftovers=sorted(leftovers))
         return code
+
+
+def install_native_reaper(client):
+    """Steam launches every game through steamrt64/reaper, an i386 binary Brook cannot run
+    (exec gives ENOEXEC: Stardew and Torchlight II exited 126 within a second, 27 Nov).
+    Put the packaged native64 build of the public upstream reaper there before each start
+    (a Steam update may restore the original), keeping the original as reaper.i386."""
+    source = os.environ.get('BROOK_STEAM_REAPER')
+    target = Path(client) / 'steamrt64/reaper'
+    if not source or not os.path.isfile(source):
+        log('native reaper not packaged; games launched through Steam may fail', reaper=str(target))
+        return
+    try:
+        with open(target, 'rb') as f:
+            head = f.read(5)
+        if head[:4] == b'\x7fELF' and head[4:5] == b'\x02':
+            with open(source, 'rb') as a, open(target, 'rb') as b:
+                if a.read() == b.read():
+                    return
+        if head[:4] == b'\x7fELF' and head[4:5] == b'\x01':
+            os.replace(target, target.with_name('reaper.i386'))
+        tmp = target.with_name('reaper.brook-new')
+        shutil.copyfile(source, tmp); os.chmod(tmp, 0o755); os.replace(tmp, target)
+        log('native64 reaper installed', reaper=str(target))
+    except OSError as error:
+        log('native reaper not installed', reaper=str(target), error=str(error))
 
 
 def ensure_dumps_dir(path=Path('/tmp/dumps')):
