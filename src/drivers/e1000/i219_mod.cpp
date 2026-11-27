@@ -457,12 +457,14 @@ bool AllocateDma(DmaRing& dma)
     }
     return true;
 }
+uint64_t g_rxRingPhys = 0;
 // The RX ring: contiguous descriptor pages (direct map), scattered 2 KiB packet buffers.
 bool AllocateRxDma(DmaRing& dma)
 {
     constexpr uint64_t flags = VMM_WRITABLE | VMM_NO_EXEC;
     const PhysicalAddress ring = PmmAllocPagesAccounted(RxDescriptorPages, MemTag::Device, KernelPid, PmmOwner::NetworkDma);
     if (!ring) return false;
+    g_rxRingPhys = ring.raw();   // the direct map is not walked by VmmVirtToPhys (2 MiB pages)
     dma.descriptors = PhysToVirt(ring);
     dma.packets = VmmAllocPagesAccounted(RxPacketPages, flags, MemTag::Device, KernelPid, PmmOwner::NetworkDma);
     if (!dma.packets) return false;
@@ -928,7 +930,11 @@ bool Attach()
     auto* txd = reinterpret_cast<TxDescriptor*>(g_txDma.descriptors.raw());
     for (uint32_t i = 0; i < RxRingSize; ++i) { rxd[i].status = 0; rxd[i].errors = 0; rxd[i].length = 0; }
     for (uint16_t i = 0; i < RingSize; ++i) { txd[i].status = DescriptorDone; txd[i].command = 0; txd[i].length = 0; }
-    const uint64_t rxPhys = VmmVirtToPhys(KernelPageTable, g_rxDma.descriptors).raw();
+    const uint64_t rxPhys = g_rxRingPhys;
+    if (!rxPhys || (rxPhys & 0xfff) || VmmVirtToPhys(KernelPageTable, g_rxDma.packets).raw() != rxd[0].address) {
+        g_failure = "RX ring address"; return false;
+    }
+    SerialPrintf("i219: RX ring %u descriptors at phys 0x%lx\n", unsigned(RxRingSize), (unsigned long)rxPhys);
     const uint64_t txPhys = VmmVirtToPhys(KernelPageTable, g_txDma.descriptors).raw();
 
     // Bus mastering: firmware already enabled it (cmd 0006); keep INTx off.
