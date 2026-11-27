@@ -632,11 +632,19 @@ bool UsbSystemBoot(uint8_t* nextDrive,bool scanComplete) {
     uint8_t sb[1024];
     if(!ReadExact(disk,systemWindow.start+1024,sb,sizeof(sb)))return Fail("ext2-read",-5);
     const auto state=LargeExt2ClassifyHeader(sb,sizeof(sb),systemWindow.length,record.uuid,admitted);
-    const bool needsCheck=state==LargeExt2HeaderState::NeedsCheck;
+    // /etc/usb-system-force-fsck (builder --usb-system-force-fsck): check a clean store too,
+    // e.g. after a boot whose stray device DMA may have reached the page cache (27 Nov i219rx).
+    VnodeStat forceMarker{};
+    const bool forced=state==LargeExt2HeaderState::Clean && VfsLstatPath(UsbSystemFsckForce,&forceMarker)!=-2;
+    const bool needsCheck=state==LargeExt2HeaderState::NeedsCheck || forced;
     if(needsCheck) {
-        boot.dirty=true;
-        KPrintf("usb-system: BROOK_SYSTEM was not cleanly unmounted\n");
-        if(!PrepareChecker())return Fail("needs-filesystem-check",-117);
+        boot.dirty=!forced;
+        if(forced)KPrintf("usb-system: BROOK_SYSTEM is clean; checking it anyway (%s)\n",UsbSystemFsckForce);
+        else KPrintf("usb-system: BROOK_SYSTEM was not cleanly unmounted\n");
+        if(!PrepareChecker()) {
+            if(forced)return Fail("forced-filesystem-check-unavailable",-117);
+            return Fail("needs-filesystem-check",-117);
+        }
     } else if(state!=LargeExt2HeaderState::Clean)return Fail("ext2-identity",-22);
     WritableDesktopFailure details{};
     VnodeStat target{};

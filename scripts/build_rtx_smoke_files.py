@@ -77,7 +77,7 @@ ETC_ALLOWED = {*MARKERS, 'i219-attach', 'i219-reset', 'hardware-payload-id', 're
                'keyboard-layout',
                'bridge-v3-operators', 'rtx-update-signer', 'restart-prompt-seconds',
                # --session desktop only
-               'live-store', 'usb-system', 'usb-system-no-fsck', 'usb-profile-plan.pub', 'usb-system-trim', 'usb-bot-legacy', 'usb-bot-pipeline', 'usb-uas', 'usb-uas-fixture', 'volatile-desktop', 'hardware-bulk', 'usb-audio-mixer', 'dp-idle-seconds', 'nv-display', 'chromium-alsa-device',
+               'live-store', 'usb-system', 'usb-system-no-fsck', 'usb-system-force-fsck', 'usb-profile-plan.pub', 'usb-system-trim', 'usb-bot-legacy', 'usb-bot-pipeline', 'usb-uas', 'usb-uas-fixture', 'volatile-desktop', 'hardware-bulk', 'usb-audio-mixer', 'dp-idle-seconds', 'nv-display', 'chromium-alsa-device',
                # --nv-gsp (GSP-RM M1 bridge verbs) and its firmware record
                'nv-gsp', 'nv-gsp-firmware', 'nv-gsp-no-autostart', 'nv-drm', 'nv-gsp-registry', 'nv-gsp-no-scrubber', 'usb-system-no-mount', 'nv-gsp-swgen0-ack', 'nv-gsp-primary', 'nv-gsp-no-ce-present', 'nv-gsp-headless-p4', 'nv-gsp-no-bar1-identity', 'nv-drm-vas-invalidate',
                # waylandd renderD130 dmabuf import (work/nv-dmabuf)
@@ -308,6 +308,8 @@ def embed_usb_system_fsck(args, initrd, roots):
         raise SystemExit(FSCK_INITRD_PATH + ' readback mismatch')
     if args.usb_system_no_fsck:
         fat_write(initrd, 'ETC/usb-system-no-fsck', b'1\n')
+    if getattr(args, 'usb_system_force_fsck', False):  # check BROOK_SYSTEM at every boot of this set, even when clean
+        fat_write(initrd, 'ETC/usb-system-force-fsck', b'1\n')
     return {'path': '/BOOT/E2FSCK.ELF', 'source': str(binary), 'bytes': info['bytes'],
             'sha256': info['sha256'], 'command': 'e2fsck -p -f /dev/brook-usb-system',
             'automatic': not args.usb_system_no_fsck}
@@ -709,6 +711,8 @@ def main():
                    help='USB system BOT test mode: legacy 64 KiB or experimental read data/status pipelining')
     p.add_argument('--usb-system-trim', metavar="'dry-run|run [MIN_MIB [MAX_MIB]]'",
                    help="scan clean ext2 free extents before mount; send UNMAP only with 'run'")
+    p.add_argument('--usb-system-force-fsck', action='store_true',
+                   help='/etc/usb-system-force-fsck: e2fsck -p -f BROOK_SYSTEM at every boot of this set, even when clean')
     p.add_argument('--usb-system-no-fsck', action='store_true',
                    help='write /etc/usb-system-no-fsck: a not-clean BROOK_SYSTEM is refused, not repaired at boot')
     p.add_argument('--nv-gsp', action='store_true',
