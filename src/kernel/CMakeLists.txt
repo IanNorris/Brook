@@ -280,6 +280,7 @@ add_executable(kernel
     src/syscall_ioctl.cpp
     src/nv_drm.cpp
     src/nv_drm_prime.cpp
+    src/nv_layer.cpp
     src/gpu_sync.cpp
     src/syscall_socket.cpp
     src/syscall_process.cpp

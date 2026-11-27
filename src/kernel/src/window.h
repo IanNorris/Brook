@@ -720,6 +720,8 @@ int WmResizeVfbForProcess(Process* proc, uint32_t wmId,
 
 // Look up a Window* given (proc, wmId).  Returns nullptr if mismatch.
 Window* WmFindWindowById(Process* proc, uint32_t wmId);
+bool WmNvLayerTarget(Process* proc, uint32_t wmId, uint64_t* identity);
+bool WmNvLayerPublish(Process* proc, uint32_t wmId, uint64_t identity);
 // Coherent owned-window geometry; output is unchanged on error.
 // Focused window for the desktop renderer's app-driven present cadence:
 // its identity and BROOK_WINDOW_STATE_* flags (VISIBLE, FOCUSED, MINIMIZED,

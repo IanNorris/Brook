@@ -101,12 +101,21 @@ OutputRect CompositorPrimaryOutputRect();
 // the GOP copy takes over with a full frame (the presenter has put the GOP surface back
 // on screen). The forced periodic full repaint is skipped while it is set.
 struct DamageRects;
+struct CompositorDirectHole { uint32_t slot; uint64_t identity; int32_t x0, y0, x1, y1; };
 struct CompositorPrimaryPresenter {
     int (*present)(const uint32_t* src, uint32_t srcStride, uint32_t width, uint32_t height, const DamageRects& damage);
     // Called once per compositor loop (completes flips, arms the queued frame). Returns the
     // longest the compositor may sleep before the next call, in ms: the flip backend paces
     // the loop to just after each vblank load.
     uint32_t (*poll)();
+    // Zero-copy step 2 (optional; nv-disp head 0 with CE present). directAvailable: the
+    // presenter can fill a hole from a window's NVK layer (nv_layer.h). setHole, called before
+    // every present (nullptr = none): the back buffer holds no valid pixels in that output-local
+    // rectangle; the presenter copies window `slot`'s layer there on every flip. captureHole:
+    // overwrite the current hole in a captured frame with what the front buffer shows.
+    bool (*directAvailable)() = nullptr;
+    void (*setHole)(const CompositorDirectHole* hole) = nullptr;
+    void (*captureHole)(uint32_t* dst, uint32_t dstStride, uint32_t width, uint32_t height) = nullptr;
 };
 inline constexpr int kPresenterBusy = -1000;
 void CompositorSetPrimaryPresenter(const CompositorPrimaryPresenter* presenter);

@@ -609,6 +609,7 @@ void SyscallTableInit()
     g_syscallTable[BROOK_SYS_WM_POINTER_TIMELINE] = sys_brook_wm_pointer_timeline;
     g_syscallTable[BROOK_SYS_INPUT_PREFERENCES] = sys_brook_input_preferences;
     g_syscallTable[0xB28]                = sys_brook_wm_exclude_capture;
+    g_syscallTable[0xB2B]                = sys_brook_wm_set_nv_layer;
     g_syscallTable[BROOK_SYS_GPU_OUTPUT_ALLOC] = sys_brook_gpu_output_alloc;
     g_syscallTable[BROOK_SYS_GPU_BUFFER_TRY_CPU_READ] = sys_brook_gpu_buffer_try_cpu_read;
     g_syscallTable[BROOK_SYS_GPU_BUFFER_SNAPSHOT_FENCE] = sys_brook_gpu_buffer_snapshot_fence;

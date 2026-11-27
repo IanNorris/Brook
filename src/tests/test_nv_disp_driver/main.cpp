@@ -4,6 +4,7 @@
 // failure fallbacks and the head-0 invariant check, against the shared fake engine.
 #include "../test_nv_disp_head/head_fake.h"
 #include "nv_disp_driver.h"
+#include "nv_disp_hole.h"
 static Rom g_rom;
 
 struct DRig{
@@ -252,7 +253,94 @@ static void TestShadowDiff(){
     brook::DamageRects d;for(int i=0;i<20;++i)d.Add({i*2,0,i*2+1,1});d.Add({5000,0,5001,1});
     assert(d.count<=brook::DamageRects::Max);bool far=false;for(uint32_t i=0;i<d.count;++i)far|=d.rects[i].x0==5000;assert(far);
 }
+
+// Zero-copy step 2 (nv_disp_hole.h): a direct window's hole is filled from its layer on every
+// flip and kept out of the shadow diff; when it moves or goes away its old rectangle is a
+// foreign region (BO pixels in the buffers, a stale shadow) that must be rewritten in every
+// buffer. Model of the CE presenter (shadow -> target copies, then the layer copy) over three
+// buffers with AgeRepair; the buffer flipped must always equal the composed frame.
+static void TestSubtractRect(){
+    brook::DamageRect out[4];
+    const brook::DamageRect r{0,0,10,10};
+    assert(SubtractRect(r,{20,20,30,30},out)==1&&out[0]==r);                    // apart
+    assert(SubtractRect(r,{0,0,10,10},out)==0);                                 // covered
+    assert(SubtractRect(r,{2,3,5,7},out)==4);                                   // inside: 4 bands
+    assert(out[0]==(brook::DamageRect{0,0,10,3})&&out[1]==(brook::DamageRect{0,7,10,10})&&
+           out[2]==(brook::DamageRect{0,3,2,7})&&out[3]==(brook::DamageRect{5,3,10,7}));
+    assert(SubtractRect(r,{5,-5,20,20},out)==1&&out[0]==(brook::DamageRect{0,0,5,10}));   // right part
+    uint64_t area=0;for(uint32_t i=0;i<SubtractRect(r,{2,3,5,7},out);++i)area+=brook::DamageRects::Area(out[i]);
+    assert(area==100-12);
+}
+struct HoleSim{
+    static constexpr uint32_t W=64,H=48;
+    std::vector<uint32_t> src=std::vector<uint32_t>(W*H),shadow=std::vector<uint32_t>(W*H),bo,buf[3];
+    bool shadowValid=false;int8_t front=0;AgeRepair age;brook::DamageRects pending;brook::DamageRect hole{};
+    uint32_t seed=1;uint64_t layerCopies=0,repairs=0,compared=0;
+    uint32_t Rnd(){seed=seed*1103515245u+12345u;return (seed>>8)|0xff000000u;}
+    HoleSim(){for(auto& b:buf){b.resize(W*H);for(auto& v:b)v=Rnd();}age.Reset();age.Stale(0);}
+    void Fill(const brook::DamageRect& r){for(int32_t y=r.y0;y<r.y1;++y)for(int32_t x=r.x0;x<r.x1;++x)src[y*W+x]=Rnd();}
+    void NewLayer(){bo.resize(W*H);for(auto& v:bo)v=Rnd()&0x00ffffffu;}       // XRGB: undefined X byte
+    // One compositor frame: damage (output-local) and the requested hole.
+    void Present(const brook::DamageRects& damage,const brook::DamageRect& want){
+        brook::DamageRects changed;
+        if(!shadowValid){shadow=src;changed=brook::DamageRects::Full(W,H);shadowValid=true;hole=want;}
+        else{
+            if(!(want==hole)){if(RepairHole(src.data(),W,shadow.data(),W,W,H,hole,brook::DamageRect{},changed))++repairs;hole=want;}
+            for(uint32_t i=0;i<damage.count;++i)compared+=HoleDiff(src.data(),W,shadow.data(),W,W,H,damage.rects[i],hole,changed);
+        }
+        pending.AddAll(changed);
+        const int8_t bb=int8_t((front+1)%3);
+        auto& d=buf[bb];
+        (void)age.Apply(bb,pending,W,H,[&](const brook::DamageRect& r){ForEachOutside(r,hole,[&](const brook::DamageRect& q){
+            for(int32_t y=q.y0;y<q.y1;++y)for(int32_t x=q.x0;x<q.x1;++x)d[y*W+x]=shadow[y*W+x];});});
+        if(!hole.empty()){CopyLayerRect(d.data(),W,hole,bo.data()+hole.y0*W+hole.x0,W);++layerCopies;}
+        pending=brook::DamageRects{};front=bb;
+    }
+    // What the head must show: the composed frame with the hole from the layer.
+    bool Shows(const std::vector<uint32_t>& b) const{
+        for(uint32_t y=0;y<H;++y)for(uint32_t x=0;x<W;++x){
+            const bool in=!hole.empty()&&int32_t(x)>=hole.x0&&int32_t(x)<hole.x1&&int32_t(y)>=hole.y0&&int32_t(y)<hole.y1;
+            const uint32_t want=in?(bo[y*W+x]|0xff000000u):src[y*W+x];
+            if(b[y*W+x]!=want)return false;}
+        return true;}
+};
+static void TestHolePresent(){
+    HoleSim s;s.NewLayer();
+    const brook::DamageRect none{},h1{8,8,40,32},h2{20,12,52,36},bar{0,44,64,48};
+    auto dmg=[](std::initializer_list<brook::DamageRect> l){brook::DamageRects d;for(auto& r:l)d.Add(r);return d;};
+    for(auto& v:s.src)v=s.Rnd();
+    s.Present(brook::DamageRects::Full(64,48),none);assert(s.Shows(s.buf[s.front]));
+    for(int i=0;i<3;++i){s.Fill(bar);s.Present(dmg({bar}),none);assert(s.Shows(s.buf[s.front]));}
+    // Direct at h1: the back buffer holds garbage there (the compositor draws nothing) and the
+    // window's damage is marked every frame; the taskbar keeps changing outside the hole.
+    const std::vector<uint32_t> before=s.src;
+    for(int i=0;i<6;++i){s.NewLayer();s.Fill(h1);s.Fill(bar);s.Present(dmg({h1,bar}),h1);assert(s.Shows(s.buf[s.front]));}
+    assert(s.layerCopies==6);
+    // A damage rect straddling the hole (garbage inside, real change outside).
+    {const brook::DamageRect straddle{4,4,44,12};s.Fill(straddle);s.NewLayer();s.Present(dmg({straddle}),h1);assert(s.Shows(s.buf[s.front]));}
+    // Move to h2 (overlapping h1): the scene redraws the old position (wallpaper) and the new one.
+    s.Fill(h1);s.Fill(h2);s.NewLayer();s.Present(dmg({h1,h2}),h2);assert(s.Shows(s.buf[s.front])&&s.repairs==1);
+    for(int i=0;i<3;++i){s.NewLayer();s.Fill(h2);s.Present(dmg({h2}),h2);assert(s.Shows(s.buf[s.front]));}
+    // Leave direct, and the foreign case: the composed window content equals what the stale
+    // shadow holds there (pre-direct pixels), so a plain shadow diff would find nothing to copy
+    // and leave the BO's pixels in every buffer.
+    for(int32_t y=h2.y0;y<h2.y1;++y)for(int32_t x=h2.x0;x<h2.x1;++x)s.src[y*64+x]=s.shadow[y*64+x];
+    s.Present(dmg({h2}),none);assert(s.Shows(s.buf[s.front])&&s.repairs==2);
+    // No stale pixels in any buffer once each has been flipped again (no new damage at all).
+    for(int i=0;i<3;++i){s.Present(brook::DamageRects{},none);assert(s.Shows(s.buf[s.front]));}
+    for(auto& b:s.buf)assert(s.Shows(b));
+    // Without the repair the foreign case is wrong: replay with RepairHole skipped.
+    {HoleSim t;t.NewLayer();for(auto& v:t.src)v=t.Rnd();t.Present(brook::DamageRects::Full(64,48),none);
+     t.Fill(h1);t.Present(dmg({h1}),h1);
+     for(int32_t y=h1.y0;y<h1.y1;++y)for(int32_t x=h1.x0;x<h1.x1;++x)t.src[y*64+x]=t.shadow[y*64+x];
+     t.hole=none;   // forget the hole without repairing it
+     t.Present(dmg({h1}),none);
+     for(int i=0;i<2;++i)t.Present(brook::DamageRects{},none);
+     bool allOk=true;for(auto& b:t.buf)allOk&=t.Shows(b);assert(!allOk);}   // the BO's frame lingers
+    (void)before;
+}
 int main(){
+    TestSubtractRect();TestHolePresent();
     TestShadowDiff();TestUsToWrap();TestHeadOneThird();TestDown1WithQueuedFrame();
     TestOutput0();TestBothOutputs();TestFailures();TestPacing();TestLoadv();TestAgeRepair();TestTripleMailbox();TestVblankCounter();
     TestMsToVblank();

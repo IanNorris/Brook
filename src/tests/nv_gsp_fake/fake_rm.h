@@ -560,26 +560,34 @@ private:
     }
   public:
     uint32_t ce_class = 0; uint32_t ce_m[8] = {}; size_t ce_launches = 0; uint64_t ce_bytes = 0;
+    uint32_t ce_remap[3] = {}; size_t ce_remaps = 0; std::vector<uint64_t> ce_order;   // launch destinations in order
     bool CeMethod(uint32_t m, uint32_t d) {
         if (m == 0) { if (d != 0xc5b5) return HostFail("SET_OBJECT class");
             bool have = false; for (auto& kv : objs) if (kv.second.cls == 0xc5b5) have = true;
             if (!have) return HostFail("SET_OBJECT without a copy object"); ce_class = d; return true; }
         if (!ce_class) return HostFail("CE method before SET_OBJECT");
         if (m >= 0x400 && m <= 0x41c) { ce_m[(m - 0x400) / 4] = d; return true; }
+        if (m >= 0x700 && m <= 0x708) { ce_remap[(m - 0x700) / 4] = d; return true; }   // REMAP_CONST_A/B, COMPONENTS
         if (m != 0x300) return HostFail("CE method");
-        // LAUNCH_DMA: only the pitch-linear, virtual, non-pipelined + flush, multi-line form Brook uses
-        if (d != (2u | 4u | (1u << 7) | (1u << 8) | (1u << 9))) return HostFail("LAUNCH_DMA flags");
+        // LAUNCH_DMA: only the pitch-linear, virtual, non-pipelined + flush, multi-line form Brook uses,
+        // optionally with component remap (zero-copy step 2: 4 x 1-byte components, W = CONST_A)
+        const uint32_t base = 2u | 4u | (1u << 7) | (1u << 8) | (1u << 9), remap = 1u << 10;
+        if (d != base && d != (base | remap)) return HostFail("LAUNCH_DMA flags");
+        const bool rm = d & remap;
+        if (rm && ce_remap[2] != (0u | (1u << 4) | (2u << 8) | (4u << 12) | (3u << 20) | (3u << 24))) return HostFail("remap components");
         const uint64_t src = (uint64_t(ce_m[0] & 0xff) << 32) | ce_m[1], dst = (uint64_t(ce_m[2] & 0xff) << 32) | ce_m[3];
-        const uint32_t pin = ce_m[4], pout = ce_m[5], len = ce_m[6], lines = ce_m[7];
+        const uint32_t pin = ce_m[4], pout = ce_m[5], lines = ce_m[7];
+        const uint32_t len = rm ? ce_m[6] * 4 : ce_m[6];   // remap: LINE_LENGTH_IN counts elements (4 bytes here)
         if (len & 3) return HostFail("line length");
         for (uint32_t y = 0; y < lines; ++y)
             for (uint32_t x = 0; x < len; x += 4) {
                 uint32_t v;
-                if (!CeRead32(src + uint64_t(y) * pin + x, &v) || !CeWrite32(dst + uint64_t(y) * pout + x, v)) {
-                    ++mmu_faults; return HostFail("CE address not mapped");
-                }
+                if (!CeRead32(src + uint64_t(y) * pin + x, &v)) { ++mmu_faults; return HostFail("CE address not mapped"); }
+                if (rm) v = (v & 0x00ffffffu) | ((ce_remap[0] & 0xffu) << 24);
+                if (!CeWrite32(dst + uint64_t(y) * pout + x, v)) { ++mmu_faults; return HostFail("CE address not mapped"); }
             }
-        ++ce_launches; ce_bytes += uint64_t(len) * lines;
+        ++ce_launches; ce_bytes += uint64_t(len) * lines; if (rm) ++ce_remaps;
+        ce_order.push_back(dst);
         return true;
     }
     // ---- TURING_A model: pitch-linear colour target 0, surface clip, clear value, CLEAR_SURFACE

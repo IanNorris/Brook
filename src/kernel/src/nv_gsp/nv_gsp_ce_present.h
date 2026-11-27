@@ -15,12 +15,19 @@ namespace brook::nvgsp {
 constexpr uint64_t kCeVaVram = 0x0000005000000000ull, kCeVramBytes = 256ull << 20;
 constexpr uint64_t kCeVaBb = 0x0000006000000000ull, kCeVaBbSlot = 1ull << 32;
 constexpr uint32_t kCeVaBbSlots = 64;
+// Zero-copy step 2: client GART BOs (physically contiguous) are mapped at kCeVaLayer + pa,
+// 2 MiB at a time and never unmapped or changed, so a mapping made for one BO serves any
+// later BO in the same 2 MiB chunks and needs no invalidate (sysmem below kCeLayerMaxPa).
+constexpr uint64_t kCeVaLayer = 0x0000010000000000ull, kCeLayerMaxPa = 64ull << 30;
+constexpr uint32_t kCeLayerChunks = uint32_t(kCeLayerMaxPa >> 21);
 constexpr uint32_t kCeHandle = 0xce5b0001;
 constexpr uint32_t kCeBudgetUs = 100000;
 
 struct CeStats {
     uint64_t frames = 0, rects = 0, bytes = 0, us_sum = 0, submits = 0, wait_us_sum = 0, waits_blocked = 0;
     uint32_t us_max = 0, remaps = 0, remap_us_max = 0, map_pages = 0, refused = 0, timeouts = 0;
+    uint64_t layer_copies = 0, layer_bytes = 0;
+    uint32_t layer_maps = 0, layer_chunks = 0, layer_refused = 0;
 };
 // Snapshot of the last semaphore timeout. poll_gap_us = time since the previous poll of this
 // ticket (or since the kick): a large gap means the CPU did not look (CPU-side stall); a small
@@ -41,6 +48,7 @@ struct CePresent {
     uint64_t kick_us = 0, last_poll_us = 0, job_bytes = 0;
     uint32_t polls = 0;
     CeStats st;
+    uint64_t layer_mapped[kCeLayerChunks / 64] = {};   // 2 MiB chunks mapped at kCeVaLayer + pa
     CeTimeout last_timeout;
     const char* last_error = "";
 };
@@ -105,6 +113,38 @@ inline bool CeMapBackBuffer(Bus& bus, const ChipOps& c, VramIo& vram, CePresent&
     return true;
 }
 
+// Make [pa, pa + bytes) readable at kCeVaLayer + pa (2 MiB SysCoh PTEs for the chunks not
+// mapped yet, then one flush + invalidate). False: not mappable (the caller copies with the CPU).
+template <class Bus, class VramIo>
+inline bool CeMapLayer(Bus& bus, const ChipOps& c, VramIo& vram, CePresent& cp, uint64_t pa, uint64_t bytes) {
+    if (!pa || !bytes || pa + bytes > kCeLayerMaxPa || pa + bytes < pa) return false;
+    const uint32_t first = uint32_t(pa >> 21), last = uint32_t((pa + bytes - 1) >> 21);
+    bool missing = false;
+    for (uint32_t i = first; i <= last; ++i) missing |= !(cp.layer_mapped[i / 64] >> (i % 64) & 1);
+    if (!missing) return true;
+    const uint64_t t0 = bus.now_us();
+    M2PtMem<VramIo> ptm{vram, cp.k.arena};
+    GmmuBuilder<M2PtMem<VramIo>> b{ptm, *c.gmmu};
+    b.Adopt(cp.k.root, Aperture::Video);
+    b.lpt_page = cp.k.lpt_page; b.lpt_off = cp.k.lpt_off; b.lpt_aper = cp.k.lpt_aper;
+    bool ok = true;
+    for (uint32_t i = first; i <= last && ok; ++i) {
+        if (cp.layer_mapped[i / 64] >> (i % 64) & 1) continue;
+        const uint64_t cpa = uint64_t(i) << 21;
+        ok = b.MapPage(kCeVaLayer + cpa, cpa, 21, Aperture::SysCoh, 0, true);
+        if (ok) { cp.layer_mapped[i / 64] |= 1ull << (i % 64); ++cp.st.layer_chunks; }
+        else cp.last_error = b.err ? b.err : "layer map (2M)";
+    }
+    cp.k.lpt_page = b.lpt_page; cp.k.lpt_off = b.lpt_off; cp.k.lpt_aper = b.lpt_aper;
+    cp.k.pt_pages += ptm.pages; cp.k.ptes += b.ptes;
+    if (!ok) return false;
+    if (!Bar1FlushInvalidate(bus, c, cp.k.root)) { cp.last_error = "MMU invalidate did not complete"; return false; }
+    ++cp.st.layer_maps;
+    const uint32_t us = uint32_t(bus.now_us() - t0);
+    if (us > cp.st.remap_us_max) cp.st.remap_us_max = us;
+    return true;
+}
+
 // Kick: build one submission (<= 100 rectangles) and ring the doorbell without
 // waiting. 1 kicked (*ticket), 0 not available (CPU copies), -1 failed (CE broken).
 template <class Bus, class VramIo, class V2P, class Sync>
@@ -112,7 +152,9 @@ inline int CePresentKick(Bus& bus, const ChipOps& c, VramIo& vram, CePresent& cp
                          uint64_t* bytes_out, uint32_t* ticket) {
     *bytes_out = 0; *ticket = 0;
     if (!cp.active || cp.broken || !cp.k.kept || cp.inflight) return 0;
-    if (!job.src || !job.width || !job.height || job.src_stride_px < job.width || !job.n || job.n > 100) return 0;
+    const bool layer = job.layer_phys != 0;
+    if (!job.src || !job.width || !job.height || job.src_stride_px < job.width || (!job.n && !layer) || job.n > 100) return 0;
+    if (layer && job.n > 99) { ++cp.st.layer_refused; return 0; }   // the push page: 99 * 10 + 15 + 8 words
     if (job.dst_vram + uint64_t(job.dst_pitch) * job.height > kCeVramBytes || job.dst_pitch < job.width * 4) {
         ++cp.st.refused; return 0;
     }
@@ -142,6 +184,23 @@ inline int CePresentKick(Bus& bus, const ChipOps& c, VramIo& vram, CePresent& cp
         n += CeCopyWords(w + n, cr, false);
         bytes += uint64_t(cr.line_bytes) * cr.lines;
         ++cp.st.rects;
+    }
+    if (layer) {
+        NvCeRect d = job.layer_dst;
+        const bool fits = d.x0 >= 0 && d.y0 >= 0 && d.x1 <= int32_t(job.width) && d.y1 <= int32_t(job.height) &&
+                          d.x1 > d.x0 && d.y1 > d.y0 && job.layer_stride >= uint32_t(d.x1 - d.x0) * 4;
+        const uint64_t lbytes = fits ? uint64_t(job.layer_stride) * uint32_t(d.y1 - d.y0 - 1) + uint32_t(d.x1 - d.x0) * 4 : 0;
+        // A failed layer map refuses the whole job (the caller copies it all with the CPU); the
+        // existing mappings stay valid, so the CE path itself stays on.
+        if (!fits || !CeMapLayer(bus, c, vram, cp, job.layer_phys, lbytes)) { ++cp.st.layer_refused; return 0; }
+        CeRect cr;
+        cr.src = kCeVaLayer + job.layer_phys;
+        cr.dst = kCeVaVram + job.dst_vram + uint64_t(d.y0) * job.dst_pitch + uint32_t(d.x0) * 4;
+        cr.src_pitch = job.layer_stride; cr.dst_pitch = job.dst_pitch;
+        cr.line_bytes = uint32_t(d.x1 - d.x0) * 4; cr.lines = uint32_t(d.y1 - d.y0);
+        n += CeOpaqueCopyWords(w + n, cr);
+        bytes += uint64_t(cr.line_bytes) * cr.lines;
+        ++cp.st.layer_copies; cp.st.layer_bytes += uint64_t(cr.line_bytes) * cr.lines;
     }
     if (!n) { *bytes_out = 0; return 0; }
     const uint32_t want = M2KeptKick(bus, c, vram, cp.k, cp.in, w, n, sync);
