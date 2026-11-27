@@ -13,6 +13,11 @@
 #include "desktop_pointer_route.h"
 #include "global_shortcuts.h"
 #include "compositor.h"
+#if defined(BROOK_NV_DISPLAY) && !defined(BROOK_HOST_TEST)
+#include "nv_disp_live.h"
+#include "nv_glass_layout.h"
+#include "desktop_capture_access.h"
+#endif
 #include "wm_capture_protection.h"
 #include "pid_namespace.h"
 #include "input_grab_policy.h"
@@ -84,6 +89,10 @@ static KMutex g_scanoutMappingLock{};
 // protects copy-out, while scene raster also snapshots dimensions and stride.
 static KMutex g_linearDisplayFrameLock{};
 static CompositorPresentLease g_presentLease{};
+#if defined(BROOK_NV_DISPLAY) && !defined(BROOK_HOST_TEST)
+static bool g_nvGlassPrimaryPresented;
+static NvGlassLeases g_nvGlassLeases;
+#endif
 // Compositor progress and guest time when the most recent leased image was
 // published. Protected by the scanout mapping lock, like the image itself.
 static uint64_t g_leasedFrameEpoch=0, g_leasedFrameTick=0;
@@ -789,10 +798,23 @@ static void CaptureCompletedDebugFrame(uint64_t epoch,const DebugFrameGeometry& 
     if (!EnsureDebugFrameBufferLocked(static_cast<uint64_t>(width)*height*4)) return;
     auto* destination=reinterpret_cast<uint32_t*>(g_debugFrameBuffer.raw());
     g_debugFrameCleanAddress=0; // full-image copy: overlay must clear fully next time
-    for (uint32_t y=0;y<height;++y)
+    uint64_t glassEpoch=0;
+#if defined(BROOK_NV_DISPLAY) && !defined(BROOK_HOST_TEST)
+    if (g_nvGlassPrimaryPresented &&
+        (!NvGlassReadFront(protectedScene?nullptr:destination,width,height,&glassEpoch) ||
+         (protectedScene && glassEpoch))) {
+        // Glass does not yet publish protected-scene provenance.
+        g_debugFrame.state=DebugFrameState::Pending;
+        return;
+    }
+#endif
+    if (glassEpoch) {
+        epoch=glassEpoch;
+        sourceKind=BROOK_DEBUG_FRAME_SOURCE_LEASED;
+    } else for (uint32_t y=0;y<height;++y)
         memcpy(destination+static_cast<uint64_t>(y)*width,source+static_cast<uint64_t>(y)*stride,width*4);
     // A direct window's pixels are only in VRAM: read its hole back from the front buffer.
-    if (g_direct.on && !gpuFrame)
+    if (g_direct.on && !gpuFrame && !glassEpoch)
         if (const auto* presenter=g_primaryPresenter; presenter && presenter->captureHole)
             presenter->captureHole(destination,width,width,height);
 #if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
@@ -2538,13 +2560,22 @@ uint64_t CompositorOverlayGeneration()
     return __atomic_load_n(&g_overlayGeneration,__ATOMIC_ACQUIRE);
 }
 
+static bool DesktopOverlaySizeAllowed(uint32_t width,uint32_t height)
+{
+#if defined(BROOK_NV_DISPLAY) && !defined(BROOK_HOST_TEST)
+    return BrookGpuNvGlassFrameFits(width,height);
+#else
+    return width && height && width<=4096 && height<=2160;
+#endif
+}
+
 // Renderer polling compares the same surface keys used to rasterise. A
 // publication wakes the compositor, so a subscriber sees it this frame.
 static void CheckDesktopOverlay(uint64_t now, const ShellFrame& frame)
 {
     const uint64_t queried=__atomic_load_n(&g_overlayQueryTick,__ATOMIC_ACQUIRE);
     if (!queried || now < queried || now - queried > OVERLAY_SUBSCRIPTION_MS ||
-        !frame.width || !frame.height || frame.width > 4096 || frame.height > 2160) return;
+        !DesktopOverlaySizeAllowed(frame.width,frame.height)) return;
     ++g_idleStats.overlayKeyChecks;
     OverlayNoteSignature(frame.slots, frame.count);
 }
@@ -2621,7 +2652,7 @@ static void CaptureDesktopOverlay(const ShellFrame& frame,uint64_t now,int32_t m
     [&]{
     CompositorMutexGuard geometry(&g_scanoutMappingLock);
     const uint32_t width=g_deskWidth,height=g_deskHeight;
-    if(!g_physFb || !width || !height || width>4096 || height>2160 ||
+    if(!g_physFb || !DesktopOverlaySizeAllowed(width,height) ||
        width != frame.width || height != frame.height)return;
     uint32_t* pixels=OverlayBufferPrepare(width,height);if(!pixels)return;
     DesktopOverlayRect rects[WM_SHELL_SURFACE_LIMIT + 1]{};
@@ -4909,7 +4940,18 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
 static void CompositorExpirePresentLease()
 {
     bool expired;
-    {CompositorMutexGuard geometry(&g_scanoutMappingLock);expired=g_presentLease.Expire(ApicTickCount());}
+    {
+        CompositorMutexGuard geometry(&g_scanoutMappingLock);
+        const uint64_t now=ApicTickCount();
+        expired=g_presentLease.Expire(now);
+#if defined(BROOK_NV_DISPLAY) && !defined(BROOK_HOST_TEST)
+        if(g_nvGlassLeases.Expire(now)) {
+            if(DesktopNvRendererOwnedBy(g_presentLease.owner))g_presentLease.Clear();
+            g_scanoutNeedsRepair=true;
+            expired=true;
+        }
+#endif
+    }
     if(expired)CompositorMarkDirty();
 }
 static bool GopShadowEnsure()
@@ -5040,6 +5082,13 @@ __attribute__((noinline)) void CompositorGetOutputs(OutputLayout& out)
 
 static void CompositorRegisterOutputs() { (void)OutputRegisterBackend(&g_gopOutputOps); }
 
+#if defined(BROOK_NV_DISPLAY) && !defined(BROOK_HOST_TEST)
+static uint32_t NvGlassOutputHead(const OutputBackendOps* backend) {
+    if(!backend || backend==&g_gopOutputOps)return 0;
+    return NvGlassIsSecondary(backend)?1u:NvGlassHeads;
+}
+#endif
+
 void CompositorSetPrimaryPresenter(const CompositorPrimaryPresenter* presenter)
 {
     CompositorMutexGuard geometry(&g_scanoutMappingLock);
@@ -5144,6 +5193,10 @@ const uint32_t* CompositorPresentSource(uint32_t* stridePixels)
         g_scanoutNeedsRepair=true;
         if(g_gopShadowValid)GopShadowInvalidate();
         if(g_displayGeneration)++g_displayGeneration;
+#if defined(BROOK_NV_DISPLAY) && !defined(BROOK_HOST_TEST)
+        if(g_nvGlassLeases.Reset(g_displayGeneration) &&
+           DesktopNvRendererOwnedBy(g_presentLease.owner))g_presentLease.Clear();
+#endif
         PublishPhysDims(w,h);
     }
     g_needsFullRepaint=true;
@@ -5208,6 +5261,9 @@ static bool CompositorFlipSoftware(bool clientFrame = false, bool hardwareCursor
     bool full=g_scanoutContainsLeasedFrame || g_scanoutNeedsRepair;
 #endif
     const uint64_t tick=ApicTickCount();
+#if defined(BROOK_NV_DISPLAY) && !defined(BROOK_HOST_TEST)
+    const uint32_t glassHeads=g_nvGlassLeases.ActiveMask(g_displayGeneration,tick);
+#endif
     // Another writer owns the framebuffer: what it holds is no longer ours.
     if(g_gopWriter || g_presentLease.Active(tick)){
         if (hardwareCursor) DisplayPrepareCursor(nullptr, 0, 0);
@@ -5261,6 +5317,9 @@ static bool CompositorFlipSoftware(bool clientFrame = false, bool hardwareCursor
     for(uint32_t i=0;i<outputs.count;++i){
         const auto* backend=outputs.backends[i];
         if(!outputs.enabled(i) || !backend || !backend->Present)continue;
+#if defined(BROOK_NV_DISPLAY) && !defined(BROOK_HOST_TEST)
+        if(glassHeads&(1u<<NvGlassOutputHead(backend)))continue;
+#endif
         const DamageRects local=DamageClipToOutput(damage,outputs.rect(i));
         if(local.empty())continue;
         OutputBuffer buffer{};
@@ -5271,7 +5330,11 @@ static bool CompositorFlipSoftware(bool clientFrame = false, bool hardwareCursor
     }
     // No registered output (the layout fell back to the framebuffer size):
     // the framebuffer itself is the one output.
-    if(!presentedAny && !outputs.backends[0]){
+    if(!presentedAny && !outputs.backends[0]
+#if defined(BROOK_NV_DISPLAY) && !defined(BROOK_HOST_TEST)
+       && !(glassHeads&1u)
+#endif
+       ){
         OutputBuffer buffer{};
         if(GopOutputAcquire(0,&buffer))flushed=GopOutputPresent(0,buffer,damage)>0;
     }
@@ -5297,6 +5360,9 @@ static bool CompositorDrawManualPowerOff()
         CompositorMutexGuard geometry(&g_scanoutMappingLock);
         if (!g_physFb || !g_deskWidth || !g_deskHeight ||
             g_gopWriter || g_presentLease.Active(ApicTickCount())) return false;
+#if defined(BROOK_NV_DISPLAY) && !defined(BROOK_HOST_TEST)
+        if(g_nvGlassLeases.ActiveMask(g_displayGeneration,ApicTickCount()))return false;
+#endif
         TtySuppressDisplay(true);
         DisplayPowerSetIdle(0);
         DisplayPrepareCursor(nullptr, 0, 0);
@@ -6062,12 +6128,93 @@ bool CompositorRefreshClientScanoutLease(uint64_t owner)
 }
 #endif
 
+#if defined(BROOK_NV_DISPLAY) && !defined(BROOK_HOST_TEST)
+int64_t CompositorPresentNvGlass(uint64_t owner, uint64_t display, void* prime,
+                                 uint32_t width, uint32_t height, uint32_t stride)
+{
+    CompositorMutexGuard frame(&g_linearDisplayFrameLock);
+    CompositorMutexGuard geometry(&g_scanoutMappingLock);
+    const uint64_t now=ApicTickCount();
+    if (!owner || !display || display!=g_displayGeneration ||
+        width!=g_deskWidth || height!=g_deskHeight) return -116;
+    if (!DesktopNvRendererOwnedBy(owner) || g_gopWriter || !g_presentLease.CanAcquire(owner,now))
+        return -16;
+    if (!WmIsActive() || !TtyDisplaySuppressed() || BootLogoActive() ||
+        ShutdownReadyForManualPowerOff()) return -11;
+
+    OutputLayout layout;
+    CompositorGetOutputs(layout);
+    g_nvGlassLeases.Reset(display);
+    uint32_t expected=0, presented=0;
+    int64_t failure=-95;
+    bool repair=false, unsupportedOutput=false;
+    const uint64_t epoch=__atomic_load_n(&g_compositorEpoch,__ATOMIC_ACQUIRE);
+    for(uint32_t i=0;i<layout.count;++i) {
+        if(!layout.enabled(i))continue;
+        const uint32_t head=NvGlassOutputHead(layout.backends[i]);
+        if(head==NvGlassHeads) {
+            unsupportedOutput=true;
+            continue;
+        }
+        expected|=1u<<head;
+        auto& lease=g_nvGlassLeases.heads[head];
+        if(!lease.CanAcquire(owner,now)) {
+            failure=-16;
+            continue;
+        }
+        const int64_t result=NvGlassPresent(head,prime,width,height,stride,layout.rect(i),epoch);
+        if(!result) {
+            if(!lease.Acquire(owner,ApicTickCount(),COMPOSITOR_PRESENT_LEASE_MS))return -75;
+            presented|=1u<<head;
+            if(head==0)g_nvGlassPrimaryPresented=true;
+        } else if(result==-5) {
+            // The copy engine is shared; immediately allow both software
+            // presenters to take over after an uncertain submission.
+            failure=result;
+            repair|=g_nvGlassLeases.Release(owner);
+            presented=0;
+            break;
+        } else if(result==-11 || result==-116) {
+            failure=result;
+        } else {
+            repair|=lease.Release(owner);
+            if(failure==-95)failure=result;
+        }
+    }
+    const uint64_t tick=ApicTickCount();
+    const uint32_t active=g_nvGlassLeases.ActiveMask(display,tick,owner);
+    if(presented && expected && !unsupportedOutput && (active&expected)==expected) {
+        if(!g_presentLease.Acquire(owner,tick,COMPOSITOR_PRESENT_LEASE_MS))return -75;
+        g_scanoutContainsLeasedFrame=true;
+        g_scanoutNeedsRepair=false;
+        g_leasedFrameTick=tick;
+        g_leasedFrameEpoch=epoch;
+        g_leasedFrameDisplay=display;
+        g_leasedFrameMode=BROOK_DEBUG_FRAME_PRESENT_NONE;
+        g_leasedFramePrivacy={};
+    } else if(!expected || unsupportedOutput || (active&expected)!=expected) {
+        repair|=g_presentLease.Release(owner);
+    }
+    if(repair) {
+        g_scanoutNeedsRepair=true;
+        CompositorMarkDirty();
+        CompositorWake();
+    }
+    if(!presented)return failure;
+    CompositorRecordDesktopPresent();
+    return 0;
+}
+#endif
+
 void CompositorReleasePresentLease(uint64_t owner)
 {
     bool released;
     {CompositorMutexGuard geometry(&g_scanoutMappingLock);
      if(owner && g_gopWriterOwner==owner)g_gopWriterRevoked=true;
      released=g_presentLease.Release(owner);
+#if defined(BROOK_NV_DISPLAY) && !defined(BROOK_HOST_TEST)
+     if(g_nvGlassLeases.Release(owner)){released=true;g_scanoutNeedsRepair=true;}
+#endif
      if(owner && g_rendererCapsOwner==owner){g_rendererCapsOwner=0;g_rendererCaps=0;}}
     if(released){CompositorMarkDirty();CompositorWake();}
 }
@@ -6081,6 +6228,9 @@ CompositorSoftwareTakeoverStats CompositorReadSoftwareTakeoverStats()
 void CompositorUnregisterProcess(Process* proc)
 {
     if (!proc) return;
+#if defined(BROOK_NV_DISPLAY) && !defined(BROOK_HOST_TEST)
+    if (!proc->isThread) DesktopNvRendererRevoke(proc->incarnation);
+#endif
     // If this process was the global input grabber, drop the reference so
     // we don't post-mortem push events into freed memory.
     CompositorClearInputGrabberIfMatches(proc);
@@ -6175,6 +6325,9 @@ static bool ReplaceCompositorFramebuffer(uint64_t fbPhys, uint32_t w, uint32_t h
         TtyRedirectToBackbuffer(buffer);
     }
     if(g_displayGeneration)++g_displayGeneration;
+#if defined(BROOK_NV_DISPLAY) && !defined(BROOK_HOST_TEST)
+    g_nvGlassLeases.Reset(g_displayGeneration);
+#endif
     g_baseBackBuffer=buffer;
     PublishFramebufferDims(w, h);
     OutputNotifyChanged();

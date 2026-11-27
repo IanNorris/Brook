@@ -12,6 +12,12 @@
 #include "gpu_buffer_abi.h"
 #include "gpu_window_source_abi.h"
 #include "desktop_layers_export.h"
+#include "desktop_capture_access.h"
+#include "fs_context.h"
+#include "mount_namespace.h"
+#include "process_fs.h"
+#include "vfs.h"
+#include "nv_disp_live.h"
 #include "intel_bdw_buffer.h"
 #include "intel_bdw_scanout.h"
 #include "intel_bdw_scanout_target.h"
@@ -131,8 +137,77 @@ static int64_t ValidateGpuWindowProvider(Process* proc,uint64_t fdValue,uint64_t
                                              static_cast<uint32_t>(peer.pid),peerIncarnation)?0:-EPERM;
 }
 
+#if (defined(BROOK_SSD_AUTO_RECOVERY) || defined(BROOK_NV_DISPLAY)) && !defined(BROOK_HOST_TEST)
+bool DesktopBootRendererAuthorized(Process* proc)
+{
+    const bool service = proc->lifecycleRole == ProcessLifecycleRole::Service;
+    const bool bootRenderer = !strcmp(proc->exePath, "/boot/VKRENDER.ELF") ||
+                              !strcmp(proc->exePath, "/BOOT/VKRENDER.ELF");
+    const bool originalNamespace = !proc->userNamespace &&
+        __atomic_load_n(&proc->mountNamespaceMember, __ATOMIC_ACQUIRE) == VfsMountNamespaceInitial();
+    if (!DesktopLayerContentAllowed(service, originalNamespace, bootRenderer, true)) return false;
+    auto* fs = ProcessFsAcquire(proc);
+    const bool globalRoot = fs && FsContextHasNamespaceRoot(fs);
+    if (fs) FsContextRelease(fs);
+    return globalRoot;
+}
+#endif
+
+#if defined(BROOK_NV_DISPLAY) && !defined(BROOK_HOST_TEST)
+static uint64_t g_nvRendererOwner;
+bool DesktopNvRendererOwnedBy(uint64_t owner)
+{
+    return owner && __atomic_load_n(&g_nvRendererOwner, __ATOMIC_ACQUIRE) == owner;
+}
+
+void DesktopNvRendererRevoke(uint64_t owner)
+{
+    if (DesktopNvRendererOwnedBy(owner)) {
+        const uint64_t departing = owner;
+        if (__atomic_compare_exchange_n(&g_nvRendererOwner, &owner, 0, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            CompositorReleasePresentLease(departing);
+    }
+}
+
+static int64_t NvRendererHandoff(uint64_t op, uint64_t arg)
+{
+    auto* proc = ProcessCurrent();
+    if (!proc || !proc->fds) return -ESRCH;
+    KernelOperationGuard operation(proc);
+    if (!DesktopBootRendererAuthorized(proc)) return -EPERM;
+    const uint64_t owner = proc->leaderIncarnation ? proc->leaderIncarnation : proc->incarnation;
+    if (op == BROOK_GPU_HANDOFF_NV_ATTACH) {
+        if (arg || !owner) return -EINVAL;
+        auto* marker = VfsOpen("/etc/nv-glass");
+        if (!marker) return -ENODEV;
+        VfsClose(marker);
+        if (!NvGlassAvailable()) return -EAGAIN;
+        uint64_t empty = 0;
+        if (!__atomic_compare_exchange_n(&g_nvRendererOwner, &empty, owner, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)
+            && empty != owner) return -16;
+        return 0;
+    }
+    if (!DesktopNvRendererOwnedBy(owner)) return -EPERM;
+    if (op == BROOK_GPU_HANDOFF_NV_DETACH) {
+        if (arg) return -EINVAL;
+        DesktopNvRendererRevoke(owner);
+        return 0;
+    }
+    BrookGpuNvPresent wire{};
+    if (!CopyFromUser(&wire, arg, sizeof(wire))) return -EFAULT;
+    if (wire.fd < 0 || uint32_t(wire.fd) >= MAX_FDS) return -EBADF;
+    FdRef source(proc, wire.fd);
+    if (!source || source->type != FdType::NvPrime || !source->handle) return -EBADF;
+    return CompositorPresentNvGlass(owner, wire.display, source->handle, wire.width, wire.height, wire.stride);
+}
+#endif
+
 int64_t sys_brook_gpu_handoff_ctl(uint64_t op,uint64_t arg,uint64_t a,uint64_t b,uint64_t c,uint64_t d)
 {
+#if defined(BROOK_NV_DISPLAY) && !defined(BROOK_HOST_TEST)
+    if (op == BROOK_GPU_HANDOFF_NV_ATTACH || op == BROOK_GPU_HANDOFF_NV_PRESENT || op == BROOK_GPU_HANDOFF_NV_DETACH)
+        return a || b || c || d ? -EINVAL : NvRendererHandoff(op, arg);
+#endif
 #if defined(BROOK_SSD_AUTO_RECOVERY) && !defined(BROOK_HOST_TEST)
     auto* proc=ProcessCurrent();if(!proc || !proc->fds)return -ESRCH;
     KernelOperationGuard operation(proc);

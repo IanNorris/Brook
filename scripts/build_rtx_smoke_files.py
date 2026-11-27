@@ -83,7 +83,8 @@ ETC_ALLOWED = {*MARKERS, 'i219-attach', 'i219-reset', 'i219-poll', 'hardware-pay
                # waylandd renderD130 dmabuf import (work/nv-dmabuf)
                'waylandd-nv-dmabuf',
                # opt-in Xwayland input tracing (waylandd key delivery, brook-xwm X routing)
-               'xwayland-input-trace'}
+               'xwayland-input-trace',
+               'waylandd-nv-no-layer', 'nv-glass'}
 # --tcp-markers: the experimental windowed TCP sender (docs/tcp-sender-pipeline-plan.md), the
 # set scripts/test_guard_repair_handoff_qemu.py exercises. The default sender is stop-and-wait
 # (one MSS per RTT: ~1.2 Mbit/s upload at a 10 ms RTT, 27 Nov desktop speed test).
@@ -319,6 +320,61 @@ def embed_usb_system_fsck(args, initrd, roots):
             'automatic': not args.usb_system_no_fsck}
 
 
+def nv_glass_icd(path):
+    # Keep the exact Nix store identity admitted at assembly. The JSON must
+    # point back into the same Mesa output and name the actual NVK driver.
+    path = path.absolute()
+    if not re.fullmatch(r'/nix/store/[a-z0-9]{32}-[a-zA-Z0-9+._-]+/share/vulkan/icd[.]d/[a-zA-Z0-9+._-]+[.]json',
+                        str(path)):
+        raise ValueError('NVK ICD must be a JSON file in a Mesa Nix store output')
+    root = path.parents[3]
+    try:
+        if not path.is_file() or path.stat().st_size > 65536:
+            raise ValueError('expected a bounded regular NVK ICD file')
+        data = path.read_bytes()
+        library = Path(json.loads(data)['ICD']['library_path'])
+    except (OSError, KeyError, TypeError, ValueError) as error:
+        raise ValueError(f'cannot read NVK ICD {path}: {error}') from error
+    if library != root / 'lib/libvulkan_nouveau.so' or not library.is_file():
+        raise ValueError('NVK ICD must point at the Mesa output’s libvulkan_nouveau.so')
+    return path, root, library
+
+
+def embed_nv_glass(args, initrd, rc):
+    icd, mesa, library = nv_glass_icd(args.nv_glass_icd)
+    start = (b'run --service --once --console --uid 1000 /boot/VKSUP.ELF --nv-glass '
+             + str(icd).encode('ascii') + b' /boot/VKRENDER.ELF')
+    if len(start) >= 256:  # Kernel Console MAX_LINE includes the terminator.
+        raise ValueError('NVK ICD path is too long for the boot service command')
+
+    roots = args.build_root / 'gcroots'
+    package = Path(run(['nix-build', '-o', roots / 'nv-glass',
+                        ROOT / 'tools/vulkan-compositor-pkg/default.nix'],
+                       stdout=subprocess.PIPE, text=True).stdout.strip())
+    gc_root(mesa, roots / 'nv-glass-mesa')
+    services = {}
+    for name, binary in (('VKSUP.ELF', 'brook-desktop-supervisor'),
+                         ('VKRENDER.ELF', 'brook-desktop-renderer')):
+        payload = (package / 'bin' / binary).read_bytes()
+        fat_write(initrd, 'BOOT/' + name, payload)
+        services[name] = hashlib.sha256(payload).hexdigest()
+    dependencies = run(['nix-store', '--query', '--requisites', package, mesa],
+                       stdout=subprocess.PIPE, text=True).stdout.splitlines()
+    fat_write(initrd, 'ETC/nv-glass', b'1\n')
+    # The first Glass path uses ordinary window snapshots, so keep the
+    # imported NVIDIA clients visible through the VFB capture path.
+    fat_write(initrd, 'ETC/waylandd-nv-no-layer', b'1\n')
+    return rc + start + b'\n', {
+        'package': str(package),
+        'services': services,
+        'icd': str(icd),
+        'icd_sha256': sha(icd),
+        'driver': str(library),
+        'driver_sha256': sha(library),
+        'runtime_store_paths': sorted(set(dependencies) - {str(package)}),
+    }
+
+
 def desktop_payload(args, initrd):
     """Embed desktop boot assets from a signed plan or the fallback RAM store."""
     from stage_clearwater_shell import add_clearwater_start, embed_clearwater_executables, embed_terminal_shortcut
@@ -463,7 +519,10 @@ def desktop_payload(args, initrd):
         if line not in rc:
             raise SystemExit('--xwm: no /boot/bin/WAYLANDD service line in INIT.RC')
         rc = rc.replace(line, line[:-1] + b' --xwayland /nix/profile/bin/Xwayland --xwm /boot/bin/BROOKXWM\n')
-    return add_clearwater_start(rc), storage
+    glass = None
+    if args.nv_glass:
+        rc, glass = embed_nv_glass(args, initrd, rc)
+    return add_clearwater_start(rc), storage, glass
 
 
 
@@ -558,10 +617,10 @@ def build(args):
     run(['mmd', '-i', initrd, '::BOOT'])
     init_rc = args.build_root / 'INIT.RC'
     init_rc_bytes = INIT_RC
-    live = None
+    live = glass = None
     shortcuts = {}
     if args.session == 'desktop':
-        init_rc_bytes, live = desktop_payload(args, initrd)
+        init_rc_bytes, live, glass = desktop_payload(args, initrd)
         shortcut = (ROOT / 'data/shortcuts/kernel_console.rc').read_bytes()
         fat_write(initrd, KERNEL_CONSOLE_SHORTCUT, shortcut)
         shortcuts[KERNEL_CONSOLE_SHORTCUT] = hashlib.sha256(shortcut).hexdigest()
@@ -622,6 +681,7 @@ def build(args):
         'i219_poll': args.i219_poll,
         'keyboard_layout': args.keyboard_layout,
         'nv_gsp': {'verbs': bool(args.nv_gsp), 'firmware': nv_gsp_fw},
+        **({'nv_glass': glass} if glass else {}),
         'helpers': helpers,
         'update_signer_public': signer_hex,
         'bridge_v3': {'operator_keys': len(keys), 'policy_sha256': hashlib.sha256(policy).hexdigest()},
@@ -714,6 +774,10 @@ def main():
     p.add_argument('--restart-prompt-seconds', type=int, choices=range(1, 601), metavar='1..600')
     p.add_argument('--tcp-markers', action='store_true',
                    help='/etc markers for the experimental windowed TCP sender (async send + adaptive 16-slot flight)')
+    p.add_argument('--nv-glass', action='store_true',
+                   help='opt into the single-output RTX Glass renderer; CPU composition is the default')
+    p.add_argument('--nv-glass-icd', type=Path, metavar='NVK_ICD_JSON',
+                   help='exact Mesa NVK ICD in the /nix store on BROOK_SYSTEM, required by --nv-glass')
     p.add_argument('--nv-display', action='store_true',
                    help='desktop image: /etc/nv-display = 1 (RTX head-0 flip presentation at desktop start)')
     p.add_argument('--panic-ingest-url-file', type=Path,
@@ -778,6 +842,19 @@ def main():
                    help='store-manifest.json of a store built with --nv-gsp-firmware: /etc/nv-gsp-firmware names '
                         'the store copy (the store itself must be the one this set boots)')
     args = p.parse_args()
+    if args.nv_glass != bool(args.nv_glass_icd):
+        p.error('--nv-glass and --nv-glass-icd must be used together')
+    if args.nv_glass:
+        if (not (args.session == 'desktop' and args.nv_display and args.nv_gsp and args.nv_drm
+                 and args.waylandd_nv_dmabuf and args.waylandd)
+                or args.nv_gsp_no_autostart or args.nv_gsp_no_ce_present
+                or args.nv_gsp_no_bar1_identity or args.usb_system_no_mount):
+            p.error('--nv-glass requires the desktop, an NV DMA-BUF Waylandd, NV display, '
+                    'GSP autostart, BAR1 identity and CE present')
+        try:
+            nv_glass_icd(args.nv_glass_icd)
+        except ValueError as error:
+            p.error(str(error))
     if args.nv_gsp_firmware and args.nv_gsp_firmware_store:
         p.error('--nv-gsp-firmware and --nv-gsp-firmware-store are alternatives')
     if args.nv_gsp_firmware_store and not args.nv_gsp:

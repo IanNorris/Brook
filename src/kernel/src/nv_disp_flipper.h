@@ -221,9 +221,9 @@ template<typename B> struct NvWindowFlipper{
     // Back buffer for the compositor: the one neither on screen nor armed.
     // Mailbox: a buffer neither on screen nor armed nor queued; with all taken, the queued
     // (not yet kicked) one is reclaimed for the newer frame.
-    int8_t Back(){
-        for(int8_t i=0;i<int8_t(nbuf);++i)if(i!=front&&i!=armed&&i!=queued)return i;
-        if(queued>=0){const int8_t q=queued;queued=-1;++st.replaced;return q;}
+    int8_t Back(int8_t excluded=-1){
+        for(int8_t i=0;i<int8_t(nbuf);++i)if(i!=front&&i!=armed&&i!=queued&&i!=excluded)return i;
+        if(queued>=0&&queued!=excluded){const int8_t q=queued;queued=-1;++st.replaced;return q;}
         return -1;}
     // Synchronous submission for teardown (restore / hide): waits for anything in
     // flight, kicks the words, waits until ARM shows (iso, offset). Bounded.

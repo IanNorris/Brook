@@ -20,6 +20,9 @@ constexpr uint32_t kCeVaBbSlots = 64;
 // later BO in the same 2 MiB chunks and needs no invalidate (sysmem below kCeLayerMaxPa).
 constexpr uint64_t kCeVaLayer = 0x0000008000000000ull, kCeLayerMaxPa = 64ull << 30;   // < 1 TiB: CE VAs are 40-bit
 constexpr uint32_t kCeLayerChunks = uint32_t(kCeLayerMaxPa >> 21);
+// A disjoint identity range in the private CE VA space for linear NVK BOs.
+constexpr uint64_t kCeVaGlass = 0x0000009800000000ull, kCeGlassMaxPa = 16ull << 30;
+constexpr uint32_t kCeGlassChunks = uint32_t(kCeGlassMaxPa >> 21);
 constexpr uint32_t kCeHandle = 0xce5b0001;
 constexpr uint32_t kCeBudgetUs = 100000;
 
@@ -49,6 +52,7 @@ struct CePresent {
     uint32_t polls = 0;
     CeStats st;
     uint64_t layer_mapped[kCeLayerChunks / 64] = {};   // 2 MiB chunks mapped at kCeVaLayer + pa
+    uint64_t glass_mapped[kCeGlassChunks / 64] = {};
     CeTimeout last_timeout;
     const char* last_error = "";
 };
@@ -145,6 +149,50 @@ inline bool CeMapLayer(Bus& bus, const ChipOps& c, VramIo& vram, CePresent& cp, 
     return true;
 }
 
+// These PTEs are written via PRAMIN on the live hook. Read each write
+// back before GPU use, including any child directory initialized by MapPage.
+template<class VramIo> struct GlassPtIo {
+    VramIo& vram;
+    uint32_t rd32(uint64_t address) { return vram.rd32(address); }
+    void wr32(uint64_t address, uint32_t value) {
+        vram.wr32(address, value);
+        (void)vram.rd32(address);
+    }
+};
+
+template<class Bus, class VramIo>
+bool CeMapGlass(Bus& bus, const ChipOps& c, VramIo& vram, CePresent& cp, uint64_t pa, uint64_t extent) {
+    constexpr uint64_t page = 1ull << 21;
+    // NVK video memory is entirely outside the low scanout and channel arenas.
+    const uint64_t limit = cp.in.si.usable_hi & ~(page - 1);
+    if (pa < 0x140000000ull || pa >= limit || pa >= kCeGlassMaxPa || !extent ||
+        extent > limit - pa || extent > kCeGlassMaxPa - pa) return false;
+    const uint32_t first = uint32_t(pa >> 21), last = uint32_t((pa + extent - 1) >> 21);
+    bool missing = false;
+    for (uint32_t i = first; i <= last; ++i) missing |= !(cp.glass_mapped[i / 64] >> (i % 64) & 1);
+    if (!missing) return true;
+
+    GlassPtIo<VramIo> io{vram};
+    M2PtMem<GlassPtIo<VramIo>> ptm{io, cp.k.arena};
+    GmmuBuilder<M2PtMem<GlassPtIo<VramIo>>> b{ptm, *c.gmmu};
+    b.Adopt(cp.k.root, Aperture::Video);
+    b.lpt_page = cp.k.lpt_page; b.lpt_off = cp.k.lpt_off; b.lpt_aper = cp.k.lpt_aper;
+    bool ok = true;
+    for (uint32_t i = first; i <= last && ok; ++i) {
+        if (cp.glass_mapped[i / 64] >> (i % 64) & 1) continue;
+        const uint64_t chunk = uint64_t(i) << 21;
+        ok = b.MapPage(kCeVaGlass + chunk, chunk, 21, Aperture::Video, 0, true);
+        if (ok) cp.glass_mapped[i / 64] |= 1ull << (i % 64);
+        else cp.last_error = b.err ? b.err : "Glass VRAM map";
+    }
+    cp.k.lpt_page = b.lpt_page; cp.k.lpt_off = b.lpt_off; cp.k.lpt_aper = b.lpt_aper;
+    cp.k.pt_pages += ptm.pages; cp.k.ptes += b.ptes;
+    if (ok && Bar1FlushInvalidate(bus, c, cp.k.root)) return true;
+    cp.broken = true; // refuse the partial mapping and all subsequent kicks
+    if (ok) cp.last_error = "Glass MMU invalidate did not complete";
+    return false;
+}
+
 // Kick: build one submission (<= 100 rectangles) and ring the doorbell without
 // waiting. 1 kicked (*ticket), 0 not available (CPU copies), -1 failed (CE broken).
 template <class Bus, class VramIo, class V2P, class Sync>
@@ -153,7 +201,12 @@ inline int CePresentKick(Bus& bus, const ChipOps& c, VramIo& vram, CePresent& cp
     *bytes_out = 0; *ticket = 0;
     if (!cp.active || cp.broken || !cp.k.kept || cp.inflight) return 0;
     const bool layer = job.layer_phys != 0;
-    if (!job.src || !job.width || !job.height || job.src_stride_px < job.width || (!job.n && !layer) || job.n > 100) return 0;
+    const bool glass = job.video_src != 0;
+    if (!job.width || !job.height) return 0;
+    if (glass) {
+        if (job.src || job.n || layer || job.width > 8192 || job.height > 8192 || job.video_pitch < job.width * 4 ||
+            (job.video_pitch & 3) || job.video_pitch > 8192 * 4) return 0;
+    } else if (!job.src || job.src_stride_px < job.width || (!job.n && !layer) || job.n > 100) return 0;
     if (layer && job.n > 99) { ++cp.st.layer_refused; return 0; }   // the push page: 99 * 10 + 15 + 8 words
     if (job.dst_vram + uint64_t(job.dst_pitch) * job.height > kCeVramBytes || job.dst_pitch < job.width * 4) {
         ++cp.st.refused; return 0;
@@ -162,12 +215,25 @@ inline int CePresentKick(Bus& bus, const ChipOps& c, VramIo& vram, CePresent& cp
     const uintptr_t end = s + (uint64_t(job.height - 1) * job.src_stride_px + job.width) * 4;
     const uintptr_t lo = s & ~uintptr_t(0xfff), hi = (end + 0xfff) & ~uintptr_t(0xfff);
     const bool inside = cp.bb_hi && lo >= cp.bb_lo && hi <= cp.bb_hi;
-    if (!inside || v2p(cp.bb_lo) != cp.bb_pa_first || v2p(cp.bb_hi - 0x1000) != cp.bb_pa_last) {
+    if (!glass && (!inside || v2p(cp.bb_lo) != cp.bb_pa_first || v2p(cp.bb_hi - 0x1000) != cp.bb_pa_last)) {
         if (!CeMapBackBuffer(bus, c, vram, cp, lo, hi, v2p)) { cp.broken = true; return -1; }
     }
     static uint32_t w[1024];   // one presenter, called under the nv-aux lock
     uint32_t n = 0;
     uint64_t bytes = 0;
+    if (glass) {
+        const uint32_t row = job.width * 4;
+        const uint64_t extent = uint64_t(job.video_pitch) * (job.height - 1) + row;
+        if (!CeMapGlass(bus, c, vram, cp, job.video_src, extent)) {
+            ++cp.st.refused;
+            return cp.broken ? -1 : 0;
+        }
+        CeRect cr{kCeVaGlass + job.video_src, kCeVaVram + job.dst_vram,
+                  job.video_pitch, job.dst_pitch, row, job.height};
+        n += CeOpaqueCopyWords(w + n, cr);
+        bytes = uint64_t(row) * job.height;
+        ++cp.st.rects;
+    }
     for (uint32_t i = 0; i < job.n; ++i) {
         NvCeRect r = job.rects[i];
         if (r.x0 < 0) r.x0 = 0;

@@ -286,6 +286,10 @@ int CompositorPresentRegions(const CompositorPresentRegion* regions,uint32_t cou
                              void* source,bool (*copy)(void*,uint64_t,void*,uint64_t),
                              uint64_t display,uint64_t backdrop,uint64_t owner,const CapturePrivacy& privacy={});
 void CompositorReleasePresentLease(uint64_t owner);
+#if defined(BROOK_NV_DISPLAY)
+int64_t CompositorPresentNvGlass(uint64_t owner, uint64_t display, void* prime,
+                                 uint32_t width, uint32_t height, uint32_t stride);
+#endif
 bool CompositorRefreshClientScanoutLease(uint64_t owner);
 
 // Begin a WM drag operation for a window at the current mouse position.
