@@ -871,10 +871,14 @@ void WmLaunchFeedbackPoll()
             // A docked window never answers a new launch: it is not shown.
             if (!w.proc || !w.visible || !w.focusable || w.docked) continue;
             SpinLockAcquire(&g_launchLock);
-            g_launchHistory.Observe(w.clientLaunchId,w.clientOrigin==WmClientOrigin::RegisteredUnixPeer,
+            g_launchHistory.Observe(w.clientLaunchId?w.clientLaunchId:w.contentLaunchId,
+                w.clientOrigin==WmClientOrigin::RegisteredUnixPeer,
                 w.creationIdentity,w.appId,w.wmId,w.creationIdentity,now);
             uint64_t token=w.clientLaunchId;
             if(w.clientOrigin==WmClientOrigin::RegisteredUnixPeer&&g_launches.Find(token)<0)token=0;
+            // An X11 window of the shared Xwayland: the provider named its
+            // client process, whose inherited launch token ends the spinner.
+            if(!token&&w.contentLaunchId&&g_launches.Find(w.contentLaunchId)>=0)token=w.contentLaunchId;
             LaunchFeedback observed{};
             if (g_launches.Window(token, w.creationIdentity, w.appId, &observed, w.wmId, w.creationIdentity, now) &&
                 observed.observedViaToken)
@@ -1208,6 +1212,7 @@ static int CreateWindowLocked(Process* proc, int16_t x, int16_t y,
     w.clientPid=proc?(proc->tgid?proc->tgid:proc->pid):0;
     w.clientIncarnation=proc?(proc->isThread?proc->leaderIncarnation:proc->incarnation):0;
     w.clientLaunchId=proc?proc->launchId:0;
+    w.contentLaunchId=0;
     w.clientOrigin=proc?WmClientOrigin::NativeProcess:WmClientOrigin::Unknown;
     w.appId[0] = w.webAppTitle[0] = w.taskbarCatalogId[0] = 0;
     w.x = x;
@@ -4057,6 +4062,20 @@ bool WmSetAppIdById(Process* proc, uint32_t wmId, const char* appId)
     RefreshWebAppTitle(*w, catalog.get());
     CompositorMarkSceneChanged();
     CompositorWake();
+    return true;
+}
+
+bool WmSetContentProcess(Process* provider,uint32_t wmId,uint16_t pid)
+{
+    if (!pid) return false;
+    Process* content=SchedulerFindProcessReference(pid);
+    if (!content) return false;
+    const uint64_t launchId=content->launchId;
+    ProcessUnref(content);
+    VfbGuard guard;
+    Window* w=WmFindWindowById(provider,wmId);
+    if (!w) return false;
+    w->contentLaunchId=launchId;
     return true;
 }
 

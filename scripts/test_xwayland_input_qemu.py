@@ -62,7 +62,7 @@ def ppm_pixel(path, x, y):
     return r << 16 | g << 8 | b
 
 
-def prepare_files(args):
+def prepare_files(args, extra=()):
     files = args.output / 'files'
     shutil.copytree(args.files, files)
     initrd = files / 'INITRD.IMG'
@@ -70,6 +70,9 @@ def prepare_files(args):
     scratch.mkdir()
     manifest = json.loads((files / 'manifest.json').read_text())
     rc = mtype(initrd, 'BOOT/INIT.RC').decode()
+    if getattr(args, 'kernel', None):
+        shutil.copyfile(args.kernel, files / 'KERNEL/BROOK.ELF')
+        manifest['files']['KERNEL/BROOK.ELF'] = {'bytes': args.kernel.stat().st_size, 'sha256': sha(args.kernel)}
     if args.waylandd:
         mput(initrd, args.waylandd.read_bytes(), 'BOOT/BIN/WAYLANDD', scratch)
     if args.xwm:
@@ -78,6 +81,8 @@ def prepare_files(args):
         assert line + '\n' in rc, rc
         rc = rc.replace(line + '\n', line + ' --xwayland /nix/profile/bin/Xwayland --xwm /boot/bin/BROOKXWM\n')
     mput(initrd, args.probe.read_bytes(), 'BOOT/BIN/XPROBE', scratch)
+    for name, data in extra:  # small helper files for a test's guest jobs
+        mput(initrd, data, name, scratch)
     mput(initrd, rc.encode(), 'BOOT/INIT.RC', scratch)
     record = mtype(initrd, 'ETC/usb-system').decode().split('\n')
     first = int(record[2].split(',')[0])
@@ -102,6 +107,7 @@ def main():
         parser.add_argument('--' + name, type=Path, required=True)
     parser.add_argument('--waylandd', type=Path)
     parser.add_argument('--xwm', type=Path)
+    parser.add_argument('--kernel', type=Path, help='replace KERNEL/BROOK.ELF in the copied set')
     parser.add_argument('--accel', choices=('kvm', 'tcg'), default='kvm')
     parser.add_argument('--dialog-delay', type=int, default=45)
     args = parser.parse_args()

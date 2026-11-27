@@ -20,6 +20,9 @@ struct brook_xwindow {
     int kernel_fullscreen;
     int32_t saved_x,saved_y;
     uint32_t saved_width,saved_height;
+    /* The X client's PID (BXWM_CLIENT_PID) and the native window it was last
+     * reported to the kernel for (launch feedback: "Starting: <app>"). */
+    uint32_t client_pid,client_pid_wm;
 };
 static struct brook_xwindow *g_xwindows;
 static struct bxwm_stream g_xwm_stream;
@@ -160,6 +163,15 @@ static int xwayland_send(struct brook_xwindow *w,uint32_t type,const BrookWindow
     return 1;
 }
 static void xwayland_apply_fullscreen(struct brook_xwindow *w);
+/* Name the X client process behind the native window, so a launch whose
+ * process tree owns it (Steam started from Apps) sees its window. */
+static void xwayland_report_client_pid(struct brook_xwindow *w) {
+    struct brook_surface *s=w->surface;
+    if (!s || !s->wm_id || !w->client_pid || w->client_pid_wm==s->wm_id) return;
+    w->client_pid_wm=s->wm_id;
+    if (syscall(BROOK_SYS_WM_SET_CONTENT_PROCESS,(long)s->wm_id,(long)w->client_pid,0L,0L,0L,0L)<0 && errno!=ESRCH)
+        fprintf(stderr,"[waylandd] X client pid %u for wm=%u: %s\n",w->client_pid,s->wm_id,strerror(errno));
+}
 static void xwayland_native_sync(struct brook_surface *s,int initial) {
     if (!s->wm_id || !xwayland_surface_ready(s)) return;
     struct brook_xwindow *w=s->xwindow;BrookWindowState geometry={0};
@@ -269,6 +281,7 @@ static void xwayland_apply_fullscreen(struct brook_xwindow *w) {
     xwayland_native_sync(s,0);
 }
 static void xwayland_surface_created(struct brook_surface *s) {
+    if (s->xwindow) xwayland_report_client_pid(s->xwindow);
     xwayland_native_sync(s,1);
 }
 static int xwayland_accept_view(struct brook_surface *s,uint32_t width,uint32_t height) {
@@ -327,6 +340,11 @@ static int xwayland_accept_message(const struct bxwm_message *message) {
     if (message->type==BXWM_DESTROY) {
         if (w && w->state.identity==message->identity) { *link=w->next;xwayland_unpair(w);free(w); }
         return 1;
+    }
+    if (message->type==BXWM_CLIENT_PID) {
+        if (!w || w->state.identity!=message->identity) return 1;
+        if (w->client_pid!=(uint32_t)message->x) { w->client_pid=(uint32_t)message->x;w->client_pid_wm=0; }
+        xwayland_report_client_pid(w);return 1;
     }
     if (message->type==BXWM_FULLSCREEN_REQUEST) {
         if (!w || w->state.identity!=message->identity || (w->state.flags&BXWM_OVERRIDE)) return 1;
@@ -550,7 +568,10 @@ static int xwayland_start(const char *server,const char *helper,const char *disp
         // Environment, not argv: an older helper ignores it. Protocol 2 lets
         // the helper send fullscreen requests and BXWM_SCALED windows.
         char scale[16];snprintf(scale,sizeof(scale),"%u",g_output_scale);
-        if (setenv("BROOK_XWM_PROTOCOL","2",1) || setenv("BROOK_XWM_SCALE",scale,1)) _exit(126);
+        // BROOK_XWM_CLIENT_PID: this waylandd accepts BXWM_CLIENT_PID (a
+        // separate opt-in, so an older helper keeps protocol 2).
+        if (setenv("BROOK_XWM_PROTOCOL","2",1) || setenv("BROOK_XWM_SCALE",scale,1) ||
+            setenv("BROOK_XWM_CLIENT_PID","1",1)) _exit(126);
         execl(helper,helper,wm_fd,control_fd,generation,(char *)NULL);_exit(127);
     }
     g_xwm_pid=child;

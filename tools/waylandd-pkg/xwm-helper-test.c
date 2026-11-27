@@ -191,6 +191,19 @@ int main(int argc,char **argv) {
     assert(tree && xcb_query_tree_children_length(tree)>0);
     int children=xcb_query_tree_children_length(tree);
     assert(xcb_query_tree_children(tree)[children-1]==id);free(tree);
+    // A mapped override-redirect menu stays above the window raised by a
+    // later activation; otherwise X sends the menu's clicks to that window.
+    xcb_window_t or_menu=xcb_generate_id(c);uint32_t override_redirect=1;
+    xcb_create_window(c,XCB_COPY_FROM_PARENT,or_menu,screen->root,60,60,50,40,0,
+        XCB_WINDOW_CLASS_INPUT_OUTPUT,screen->root_visual,XCB_CW_OVERRIDE_REDIRECT,&override_redirect);
+    xcb_map_window(c,or_menu);xcb_flush(c);
+    receive(control,BXWM_WINDOW,or_menu,0,50,40);
+    send_command(control,active,BXWM_FOCUS);assert(wait_protocol(c,protocols,focus));
+    send_command(control,configured,BXWM_FOCUS);assert(wait_protocol(c,protocols,focus));
+    tree=xcb_query_tree_reply(c,xcb_query_tree(c,screen->root),NULL);assert(tree);
+    children=xcb_query_tree_children_length(tree);
+    assert(xcb_query_tree_children(tree)[children-1]==or_menu && xcb_query_tree_children(tree)[children-2]==id);
+    free(tree);xcb_destroy_window(c,or_menu);xcb_flush(c);
     xcb_atom_t net_state=atom(c,"_NET_WM_STATE"),max_h=atom(c,"_NET_WM_STATE_MAXIMIZED_HORZ"),
         max_v=atom(c,"_NET_WM_STATE_MAXIMIZED_VERT"),moveresize=atom(c,"_NET_WM_MOVERESIZE");
     xcb_client_message_event_t request={.response_type=XCB_CLIENT_MESSAGE,.format=32,.window=id,.type=net_state};

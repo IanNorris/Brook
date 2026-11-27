@@ -5,6 +5,7 @@
 #include <xcb/xcb.h>
 #include <xcb/composite.h>
 #include <xcb/xcb_cursor.h>
+#include <xcb/res.h>
 #include <poll.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -31,7 +32,7 @@ struct xwm {
     struct window *windows;
     xcb_atom_t serial,protocols,delete_window,take_focus,hints,transient,motif;
     xcb_atom_t utf8,name,supporting,supported,active,wm_state;
-    xcb_atom_t time_property,net_state,max_h,max_v,fullscreen,moveresize,change_state;
+    xcb_atom_t time_property,net_state,max_h,max_v,fullscreen,moveresize,change_state,net_pid;
     xcb_timestamp_t timestamp;
     uint32_t time_counter;
     struct bxwm_message pending_focus;
@@ -40,6 +41,7 @@ struct xwm {
      * original wire use; 2 adds fullscreen requests and BXWM_SCALED windows,
      * which an older waylandd would reject as malformed. */
     int protocol;
+    int client_pids; /* BROOK_XWM_CLIENT_PID=1: waylandd accepts BXWM_CLIENT_PID */
     uint32_t scale,client_mask;
     const char *scaled_apps;
     uint32_t scaled_clients[64];
@@ -137,6 +139,25 @@ static void decide_scale(struct xwm *wm,struct window *w) {
             (!best || other->activity>best->activity)) best=other;
     w->inferred_parent=best?best->state.window:XCB_WINDOW_NONE;
 }
+/* The X client's process: X-Resource reports the server's own peer
+ * credentials; _NET_WM_PID is the client's claim, used only as a fallback.
+ * Either only lets launch feedback recognise this window's launch. */
+static uint32_t client_pid(struct xwm *wm,xcb_window_t window) {
+    xcb_res_client_id_spec_t spec={.client=window,.mask=XCB_RES_CLIENT_ID_MASK_LOCAL_CLIENT_PID};
+    xcb_res_query_client_ids_reply_t *ids=xcb_res_query_client_ids_reply(wm->xcb,
+        xcb_res_query_client_ids(wm->xcb,1,&spec),NULL);
+    uint32_t pid=0;
+    if (ids) {
+        for (xcb_res_client_id_value_iterator_t it=xcb_res_query_client_ids_ids_iterator(ids);it.rem;
+             xcb_res_client_id_value_next(&it))
+            if ((it.data->spec.mask&XCB_RES_CLIENT_ID_MASK_LOCAL_CLIENT_PID) &&
+                xcb_res_client_id_value_value_length(it.data)==1)
+                pid=*xcb_res_client_id_value_value(it.data);
+        free(ids);
+    }
+    if (!pid && wm->net_pid) pid=property_word(wm,window,wm->net_pid,0);
+    return pid<=65535?pid:0;
+}
 static int refresh(struct xwm *wm,struct window *w) {
     xcb_get_geometry_reply_t *geometry=xcb_get_geometry_reply(wm->xcb,xcb_get_geometry(wm->xcb,w->state.window),NULL);
     xcb_get_window_attributes_reply_t *attributes=xcb_get_window_attributes_reply(wm->xcb,
@@ -149,6 +170,7 @@ static int refresh(struct xwm *wm,struct window *w) {
     w->state.x=geometry->x;w->state.y=geometry->y;
     w->state.width=geometry->width;w->state.height=geometry->height;
     const unsigned was_mapped=w->state.flags&BXWM_MAPPED;
+    int newly_mapped=0;
     w->state.flags=(w->state.flags&(BXWM_MAXIMIZED|BXWM_MINIMIZED|BXWM_FULLSCREEN|BXWM_SCALED))|
         (attributes->override_redirect?BXWM_OVERRIDE:0)|
         (attributes->map_state!=XCB_MAP_STATE_UNMAPPED?BXWM_MAPPED:0)|BXWM_INPUT;
@@ -169,7 +191,7 @@ static int refresh(struct xwm *wm,struct window *w) {
     }
     free(motif);
     if ((w->state.flags&BXWM_MAPPED) && !was_mapped) {
-        w->activity=++wm->activity;
+        w->activity=++wm->activity;newly_mapped=1;
         decide_scale(wm,w);
     }
     uint32_t parent=property_word(wm,w->state.window,wm->transient,0);
@@ -192,7 +214,19 @@ static int refresh(struct xwm *wm,struct window *w) {
         if (length>=sizeof(w->state.title)) length=sizeof(w->state.title)-1;
         memcpy(w->state.title,xcb_get_property_value(title),length);
     }
-    free(title);return publish(wm,w);
+    free(title);
+    if (!publish(wm,w)) return 0;
+    if (newly_mapped)
+        fprintf(stderr,"[brook-xwm] map 0x%x %ux%u%+d%+d flags=0x%x parent=0x%x \"%.40s\"\n",w->state.window,
+                w->state.width,w->state.height,w->state.x,w->state.y,w->state.flags,w->state.parent,w->state.title);
+    if (newly_mapped && wm->client_pids && !(w->state.flags&BXWM_OVERRIDE)) {
+        uint32_t pid=client_pid(wm,w->state.window);
+        if (pid) {
+            struct bxwm_message message=w->state;message.type=BXWM_CLIENT_PID;message.x=(int32_t)pid;
+            return emit(wm,&message);
+        }
+    }
+    return 1;
 }
 static struct window *track(struct xwm *wm,xcb_window_t id) {
     struct window *w=find(wm,id);if (w) return w;
@@ -294,6 +328,22 @@ static int command(struct xwm *wm,const struct bxwm_message *message) {
         {
             uint32_t above=XCB_STACK_MODE_ABOVE;
             xcb_configure_window(wm->xcb,message->window,XCB_CONFIG_WINDOW_STACK_MODE,&above);
+            // Keep mapped override-redirect windows (menus, dropdowns,
+            // tooltips) above it, in their stacking order, as Brook keeps
+            // native popups above a newly focused window. The raise arrives
+            // after the click that may have opened a menu; without this the
+            // menu stays visible natively but X hit-tests its area to the
+            // raised window beneath, so the menu ignores the pointer.
+            xcb_query_tree_reply_t *tree=xcb_query_tree_reply(wm->xcb,xcb_query_tree(wm->xcb,wm->root),NULL);
+            if (tree) {
+                xcb_window_t *children=xcb_query_tree_children(tree);
+                for (int i=0;i<xcb_query_tree_children_length(tree);++i) {
+                    struct window *popup=find(wm,children[i]);
+                    if (popup && popup!=w && (popup->state.flags&(BXWM_OVERRIDE|BXWM_MAPPED))==(BXWM_OVERRIDE|BXWM_MAPPED))
+                        xcb_configure_window(wm->xcb,children[i],XCB_CONFIG_WINDOW_STACK_MODE,&above);
+                }
+                free(tree);
+            }
         }
         // Obtain an X-server timestamp asynchronously. Brook monotonic time is
         // not in the X server's clock domain, and WM_TAKE_FOCUS forbids zero.
@@ -542,7 +592,7 @@ static int initialize(struct xwm *wm,int wm_fd) {
     wm->time_property=atom(wm,"_BROOK_XWM_TIME");
     wm->net_state=atom(wm,"_NET_WM_STATE");wm->max_h=atom(wm,"_NET_WM_STATE_MAXIMIZED_HORZ");
     wm->max_v=atom(wm,"_NET_WM_STATE_MAXIMIZED_VERT");wm->fullscreen=atom(wm,"_NET_WM_STATE_FULLSCREEN");wm->moveresize=atom(wm,"_NET_WM_MOVERESIZE");
-    wm->change_state=atom(wm,"WM_CHANGE_STATE");
+    wm->change_state=atom(wm,"WM_CHANGE_STATE");wm->net_pid=atom(wm,"_NET_WM_PID");
     if (!wm->serial || !wm->wm_state) return 0;
     uint32_t mask=XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT|XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY|XCB_EVENT_MASK_PROPERTY_CHANGE;
     xcb_generic_error_t *error=xcb_request_check(wm->xcb,xcb_change_window_attributes_checked(wm->xcb,wm->root,XCB_CW_EVENT_MASK,&mask));
@@ -578,6 +628,8 @@ int main(int argc,char **argv) {
     struct xwm wm={.control=(int)control,.generation=generation,.protocol=1,.scale=1};
     const char *protocol=getenv("BROOK_XWM_PROTOCOL"),*scale=getenv("BROOK_XWM_SCALE");
     if (protocol && !strcmp(protocol,"2")) wm.protocol=2;
+    const char *client_pids=getenv("BROOK_XWM_CLIENT_PID");
+    wm.client_pids=client_pids && !strcmp(client_pids,"1");
     if (scale && scale[0]>='1' && scale[0]<='4' && !scale[1]) wm.scale=(uint32_t)(scale[0]-'0');
     wm.scaled_apps=getenv("BROOK_XWAYLAND_SCALED_APPS");
     int success=initialize(&wm,(int)wm_fd);

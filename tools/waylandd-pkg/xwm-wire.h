@@ -16,6 +16,9 @@ enum {
     BXWM_BEGIN_MOVE=5, BXWM_MAXIMIZE=6, BXWM_MINIMIZE=7, BXWM_BEGIN_RESIZE=8,
     /* EWMH _NET_WM_STATE_FULLSCREEN request: x is 0 remove, 1 add, 2 toggle. */
     BXWM_FULLSCREEN_REQUEST=9,
+    /* With BROOK_XWM_CLIENT_PID=1: x is the X client's process ID (X-Resource, else
+     * _NET_WM_PID), so launch feedback can find the launch it belongs to. */
+    BXWM_CLIENT_PID=10,
     BXWM_CONFIGURE=16, BXWM_FOCUS=17, BXWM_CLOSE=18,
     BXWM_MAPPED=1u<<0, BXWM_OVERRIDE=1u<<1, BXWM_INPUT=1u<<2,
     BXWM_CLIENT_CHROME=1u<<3,
@@ -82,6 +85,7 @@ static int bxwm_valid(const struct bxwm_message *message,uint64_t generation,int
     if (from_helper && (message->type==BXWM_MAXIMIZE || message->type==BXWM_FULLSCREEN_REQUEST))
         return message->x>=0 && message->x<=2;
     if (from_helper && message->type==BXWM_BEGIN_RESIZE) return message->x>=0 && message->x<=7;
+    if (from_helper && message->type==BXWM_CLIENT_PID) return message->x>0 && message->x<=65535;
     if (from_helper && message->type==BXWM_DESTROY) return 1;
     if (from_helper && message->type==BXWM_WINDOW)
         return message->width && message->height && message->width<=65535 && message->height<=65535 &&
