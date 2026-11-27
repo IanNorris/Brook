@@ -35,6 +35,7 @@
 #include "memory/address.h"
 #include "mouse.h"
 #include "window.h"
+#include "nv_layer.h"
 #include "desktop_shell_surfaces.h"
 #include "desktop_disk_popup.h"
 #include "desktop_stats_popup.h"
@@ -96,6 +97,12 @@ static CapturePrivacy g_leasedFramePrivacy{};
 static bool g_scanoutContainsLeasedFrame=false, g_scanoutNeedsRepair=false;
 // D2 flip presenter for the primary output (CompositorSetPrimaryPresenter).
 static const CompositorPrimaryPresenter* volatile g_primaryPresenter=nullptr;
+// Zero-copy step 2: the window shown straight from its NVK layer (its client rectangle is a
+// hole in the back buffer that the presenter fills), as last told to the presenter.
+// Compositor thread only.
+struct CompositorDirect { bool on=false; uint32_t slot=0; uint64_t identity=0; SceneRect hole{}; };
+static CompositorDirect g_direct{};
+static uint64_t g_directFrames=0,g_directTransitions=0,g_directCursorExits=0;
 static CompositorSoftwareTakeoverStats g_softwareTakeover{};
 // Zero means generation tracking has exhausted its unique identifiers.
 // Protected by g_scanoutMappingLock, together with the display mapping.
@@ -784,6 +791,10 @@ static void CaptureCompletedDebugFrame(uint64_t epoch,const DebugFrameGeometry& 
     g_debugFrameCleanAddress=0; // full-image copy: overlay must clear fully next time
     for (uint32_t y=0;y<height;++y)
         memcpy(destination+static_cast<uint64_t>(y)*width,source+static_cast<uint64_t>(y)*stride,width*4);
+    // A direct window's pixels are only in VRAM: read its hole back from the front buffer.
+    if (g_direct.on && !gpuFrame)
+        if (const auto* presenter=g_primaryPresenter; presenter && presenter->captureHole)
+            presenter->captureHole(destination,width,width,height);
 #if defined(BROOK_SSD_AUTO_RECOVERY) && defined(BROOK_BDW_SCANOUT_FLIP)
     if (cursor && sourceKind!=BROOK_DEBUG_FRAME_SOURCE_LEGACY_GPU && BdwScanoutCaptureCursor(destination,width,height))
         infoFlags|=BROOK_DEBUG_FRAME_INFO_CURSOR_COMPOSITED|BROOK_DEBUG_FRAME_INFO_CURSOR_PLANE_VISIBLE;
@@ -1801,7 +1812,8 @@ static void BlitWallpaperRegion(const SceneRect& region);
 // `BlitProcessAt` so we don't need to fake a Process struct.
 static bool BlitWindowVfb(const uint32_t* src,
                            uint32_t srcW, uint32_t srcH, uint32_t srcStride,
-                           int dstX0, int dstY0, const SceneRect* limit, bool restoreBackdrop)
+                           int dstX0, int dstY0, const SceneRect* limit, bool restoreBackdrop,
+                           bool opaque = false)
 {
     if (!src || srcW == 0) return false;
     uint32_t* dstBase = g_backBuffer ? g_backBuffer : const_cast<uint32_t*>(g_physFb);
@@ -1833,6 +1845,8 @@ static bool BlitWindowVfb(const uint32_t* src,
         uint32_t* dstRow = dstBase +
             static_cast<uint64_t>(y) * dstStride + static_cast<uint32_t>(clip.left);
 
+        // An NVK client layer (zero-copy step 2) is XRGB with an undefined X byte: opaque.
+        if (opaque) { for (uint32_t x=0;x<rowLen;++x) dstRow[x]=srcRow[x]|0xff000000u; continue; }
         SceneBlitWindowRow(dstRow,srcRow,rowLen,[&] {
             if (restoreBackdrop)
                 DeskBackdropSpan(dstRow,uint32_t(clip.left),uint32_t(clip.right),uint32_t(y));
@@ -2813,6 +2827,43 @@ static void DragProbeStep()
     WmMoveWindow(slot,int16_t(g_dragProbeX+off),g_dragProbeY);
 }
 
+// Zero-copy step 2: the topmost window with an NVK layer that can be shown directly: 1:1,
+// opaque, the layer the size of its client area, inside head 0, and nothing drawn over its
+// client area (no higher window, shell surface, caption overlay or software cursor).
+static CompositorDirect PickDirectWindow(const int* sorted,uint32_t wcount,const ShellFrame& shell,int32_t mx,int32_t my)
+{
+    const SceneRect head{0,0,int64_t(g_physFbWidth),int64_t(g_physFbHeight)};
+    SceneRect cursor{};
+    if (MouseIsAvailable()) {
+        const int64_t cx=int64_t(mx)-g_cursorFrame.hotX,cy=int64_t(my)-g_cursorFrame.hotY;
+        cursor=SceneRect{cx,cy,cx+g_cursorFrame.width,cy+g_cursorFrame.height};
+    }
+    for (int32_t i=int32_t(wcount)-1;i>=0;--i) {
+        Window* w=WmGetWindow(sorted[i]);
+        if (!w || !w->proc || !w->visible || w->minimized) continue;
+        NvLayer layer{};
+        if (!w->vfb || !NvLayerGet(uint32_t(sorted[i]),w->creationIdentity,&layer,false)) continue;
+        if ((w->upscale!=1 && w->upscale!=0) || w->opacity!=255 || w->captionOverlay || w->captureExcluded ||
+            layer.w!=w->clientW || layer.h!=w->clientH) continue;
+        const SceneRect hole{w->clientX(),w->clientY(),int64_t(w->clientX())+w->clientW,int64_t(w->clientY())+w->clientH};
+        if (hole.empty() || !head.covers(hole) || hole.right>g_deskWidth || hole.bottom>g_deskHeight) continue;
+        if (hole.intersects(cursor)) continue;
+        bool covered=false;
+        for (uint32_t j=uint32_t(i)+1;j<wcount && !covered;++j) {
+            const Window* h=WmGetWindow(sorted[j]);
+            if (!h || !h->proc || !h->visible || h->minimized) continue;
+            covered=hole.intersects(SceneRect{h->x,h->y,int64_t(h->x)+h->outerWidth(),int64_t(h->y)+h->outerHeight()});
+        }
+        for (uint32_t k=0;k<shell.count && !covered;++k) {
+            const auto& r=shell.slots[k].rect;
+            covered=hole.intersects(SceneRect{r.x,r.y,int64_t(r.x)+r.width,int64_t(r.y)+r.height});
+        }
+        if (covered) continue;
+        return CompositorDirect{true,uint32_t(sorted[i]),w->creationIdentity,hole};
+    }
+    return CompositorDirect{};
+}
+
 static void CompositorLoopWM(bool& clientFrame, uint64_t& captureScene)
 {
     // Apply movement/focus/resize before rendering either chrome or content.
@@ -2993,6 +3044,28 @@ static void CompositorLoopWM(bool& clientFrame, uint64_t& captureScene)
 #if defined(BROOK_GPU_SUBMISSION_TIMING) && !defined(BROOK_HOST_TEST)
     TraceDesktopCycle(FrameDesktopCadence,now);
 #endif
+    {   // Zero-copy step 2: choose the direct window. Leaving (or moving) a hole redraws its old
+        // rectangle from the scene; the presenter rewrites it in every buffer (nv_disp_hole.h).
+        CompositorDirect direct{};
+        const auto* presenter=g_primaryPresenter;
+        if (presenter && presenter->setHole && presenter->directAvailable && !CompositorGpuActive() &&
+            !skipCpuScene && !rendererLeased && !CompositorPacingProbe() && presenter->directAvailable())
+            direct=PickDirectWindow(sorted,wcount,shell,chromeMx,chromeMy);
+        const auto& was=g_direct;
+        const bool same=direct.on==was.on && (!direct.on || (direct.slot==was.slot && direct.identity==was.identity &&
+            direct.hole.left==was.hole.left && direct.hole.top==was.hole.top && direct.hole.right==was.hole.right &&
+            direct.hole.bottom==was.hole.bottom));
+        if (!same) {
+            ++g_directTransitions;
+            if (was.on) {
+                sceneDamage.Add({int32_t(was.hole.left),int32_t(was.hole.top),int32_t(was.hole.right),int32_t(was.hole.bottom)});
+                MarkDirtyRect(was.hole.left,was.hole.top,was.hole.right,was.hole.bottom);
+            }
+            if (direct.on) MarkDirtyRect(direct.hole.left,direct.hole.top,direct.hole.right,direct.hole.bottom);
+        }
+        g_direct=direct;
+        if (direct.on) ++g_directFrames;
+    }
     SceneRect cpuDamage;
     const bool cpuPartial=!CompositorGpuActive() && !fullRepaint && !skipCpuScene;
     // Partial repaint: which layers must be redrawn whole (expand) and which can be
@@ -3072,6 +3145,14 @@ static void CompositorLoopWM(bool& clientFrame, uint64_t& captureScene)
         // the window (nullifying vfb/vfbStride/vfbBytes) concurrently.
         uint32_t* localVfb=nullptr;uint32_t localStride=0;uint64_t localBytes=0;
         WmSnapshotVfb(w,&localVfb,&localStride,&localBytes);
+        // Zero-copy step 2: a window with an NVK layer shows the client's buffer, not its VFB.
+        NvLayer layer{};
+        const bool layered=localVfb && NvLayerGet(uint32_t(sorted[i]),w->creationIdentity,&layer,true);
+        const bool directHole=layered && g_direct.on && g_direct.slot==uint32_t(sorted[i]) && g_direct.identity==w->creationIdentity;
+        if (layered) {
+            localVfb=reinterpret_cast<uint32_t*>(PhysToVirt(PhysicalAddress(layer.phys)).raw());
+            localStride=layer.stride/4;localBytes=uint64_t(layer.stride)*layer.h;
+        }
 
         if (localVfb && localStride)
         {
@@ -3088,21 +3169,29 @@ static void CompositorLoopWM(bool& clientFrame, uint64_t& captureScene)
             if (!CompositorGpuActive())
             {
                 // Clamp blit to the buffer that was actually allocated.
-                uint32_t vfbW = localStride;
+                uint32_t vfbW = layered ? layer.w : localStride;
                 uint32_t vfbH = static_cast<uint32_t>(localBytes / (uint64_t)localStride / 4);
                 uint32_t blitW = w->clientW < vfbW ? w->clientW : vfbW;
                 uint32_t blitH = w->clientH < vfbH ? w->clientH : vfbH;
                 const bool freshClient = w->vfbDirty && !p->isKernelThread && p->state != ProcessState::Terminated;
-                if (blitW && blitH) {
+                if (directHole) {
+                    // The presenter fills the client area from the layer; a new client frame
+                    // only needs the damage that makes it flip.
+                    restoreBackdrop();
+                    if (w->vfbDirty || fullRepaint)
+                        MarkDirtyRect(g_direct.hole.left,g_direct.hole.top,g_direct.hole.right,g_direct.hole.bottom);
+                    clientFrame |= freshClient;
+                } else if (blitW && blitH) {
                     const bool copied = BlitWindowVfb(localVfb, blitW, blitH, localStride,
                                                       w->clientX(), w->clientY(), cpuPartial ? &cpuDamage : nullptr,
-                                                      backdropPending);
+                                                      backdropPending, layered);
                     backdropPending=false;
                     clientFrame |= freshClient && copied;
                 }
                 w->vfbDirty = 0;  // single-writer (compositor thread), no race
             }
         }
+        if (layered) NvLayerPut(layer);
         else if (p->state != ProcessState::Terminated && p->fbVfbWidth > 0)
         {
             if (!fullRepaint && !cpuPartial && !p->fbDirty && !anyBelowBlitted)
@@ -5441,6 +5530,18 @@ static void CompositorLoop()
         hardwareCursor = DisplayPrepareCursor(displayOwned ? &g_cursorFrame : nullptr, mx, my);
         if (!hardwareCursor) {
             const int64_t drawX = int64_t(mx) - g_cursorFrame.hotX, drawY = int64_t(my) - g_cursorFrame.hotY;
+            // Zero-copy step 2: the pointer moved onto the direct window since the choice. Put
+            // the layer into the back buffer first (it is topmost there), then draw over it.
+            if (g_direct.on && g_direct.hole.intersects(SceneRect{drawX,drawY,drawX+g_cursorFrame.width,drawY+g_cursorFrame.height})) {
+                NvLayer layer{};
+                if (NvLayerGet(g_direct.slot,g_direct.identity,&layer,true)) {
+                    (void)BlitWindowVfb(reinterpret_cast<const uint32_t*>(PhysToVirt(PhysicalAddress(layer.phys)).raw()),
+                                        layer.w,layer.h,layer.stride/4,int(g_direct.hole.left),int(g_direct.hole.top),nullptr,false,true);
+                    NvLayerPut(layer);
+                }
+                MarkDirtyRect(g_direct.hole.left,g_direct.hole.top,g_direct.hole.right,g_direct.hole.bottom);
+                g_direct=CompositorDirect{};++g_directCursorExits;
+            }
             MarkDirtyRect(drawX, drawY, drawX + g_cursorFrame.width, drawY + g_cursorFrame.height);
             CursorDraw(mx, my);
         }
@@ -5484,6 +5585,13 @@ static void CompositorLoop()
     else
     {
         DrawPacingProbe();
+        if (const auto* presenter=g_primaryPresenter; presenter && presenter->setHole) {
+            if (g_direct.on) {
+                const CompositorDirectHole hole{g_direct.slot,g_direct.identity,int32_t(g_direct.hole.left),int32_t(g_direct.hole.top),
+                                                int32_t(g_direct.hole.right),int32_t(g_direct.hole.bottom)};
+                presenter->setHole(&hole);
+            } else presenter->setHole(nullptr);
+        }
         const uint64_t composedNs=FrameNowNs();
         CompositorFlipSoftware(clientFrame, hardwareCursor);
         const uint64_t endNs=FrameNowNs();

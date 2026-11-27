@@ -567,6 +567,9 @@ struct brook_surface {
     /* Frame pacing (status "pacing"): last buffer commit and last frame
      * callback sent, in microseconds. */
     uint64_t pace_commit_us,pace_callback_us;
+    /* Zero-copy step 2: the image whose nv dmabuf the kernel shows for this window (one
+     * reference; its wl_buffer is released when it is replaced or detached). */
+    struct brook_image *nv_layer_image;
     struct frame_latency latency;
     /* Status diagnostics ("surfaces" in the status file): the newest serial
      * the client acknowledged, and when it acked, was last configured and
@@ -679,6 +682,46 @@ static void xwayland_pair_surfaces(void);
 static void xwayland_generation_lost(void);
 static int xwayland_accept_view(struct brook_surface *,uint32_t,uint32_t);
 static uint32_t xwayland_surface_scale(const struct brook_surface *s);
+/* Native-scale clients (zero-copy step 2): a client started with BROOK_WAYLAND_NATIVE_SCALE=1
+ * in its environment (/boot/bin/vkdirect sets it) sees output scale 1 (wl_output.scale 1,
+ * fractional 120) and is configured in physical pixels, fullscreen and maximised included,
+ * so its buffers are 1:1 with its window and the kernel can show them directly. Read once
+ * per client from /proc/<pid>/environ. */
+static struct wl_client *g_xwayland_client;   /* xwayland-shell.h */
+struct native_client { struct wl_client *client;int native;struct wl_listener destroy;struct native_client *next; };
+static struct native_client *g_native_clients;
+static void native_client_destroyed(struct wl_listener *l,void *data){
+    (void)data;struct native_client *n=wl_container_of(l,n,destroy);
+    for(struct native_client **p=&g_native_clients;*p;p=&(*p)->next)if(*p==n){*p=n->next;break;}
+    free(n);
+}
+static int environ_native_scale(pid_t pid){
+    char path[48];snprintf(path,sizeof(path),"/proc/%d/environ",(int)pid);
+    FILE *f=fopen(path,"r");if(!f)return 0;
+    static const char key[]="BROOK_WAYLAND_NATIVE_SCALE=1";
+    char buf[4096];size_t n,keep=0;int found=0;
+    /* entries are NUL-separated; match a whole entry */
+    while(!found && (n=fread(buf+keep,1,sizeof(buf)-1-keep,f))>0){
+        n+=keep;buf[n]=0;size_t i=0;
+        while(i<n){size_t len=strnlen(buf+i,n-i);
+            if(i+len==n && !feof(f)){memmove(buf,buf+i,len);keep=len;break;}
+            if(len==sizeof(key)-1 && !memcmp(buf+i,key,len)){found=1;break;}
+            i+=len+1;keep=0;}
+        if(keep>=sizeof(buf)-2)keep=0;
+    }
+    fclose(f);return found;
+}
+static int client_native_scale(struct wl_client *client){
+    if(!client || client==g_xwayland_client)return 0;
+    for(struct native_client *n=g_native_clients;n;n=n->next)if(n->client==client)return n->native;
+    struct native_client *n=calloc(1,sizeof(*n));if(!n)return 0;
+    pid_t pid=0;uid_t uid;gid_t gid;wl_client_get_credentials(client,&pid,&uid,&gid);
+    n->client=client;n->native=pid>0 && environ_native_scale(pid);
+    n->destroy.notify=native_client_destroyed;wl_client_add_destroy_listener(client,&n->destroy);
+    n->next=g_native_clients;g_native_clients=n;
+    if(n->native)fprintf(stderr,"[waylandd] client pid=%d: native scale (physical pixels)\n",(int)pid);
+    return n->native;
+}
 static uint32_t surface_output_scale(const struct brook_surface *s) {
     if (s->is_cursor && s->cursor_output_scale) return s->cursor_output_scale;
     bool fractional=s->fractional_scale!=NULL;
@@ -687,6 +730,7 @@ static uint32_t surface_output_scale(const struct brook_surface *s) {
         fractional|=s->fractional_scale!=NULL;
     }
     if (s->role==4) return xwayland_surface_scale(s)*BROOK_WL_SCALE_ONE;
+    if (s->resource && client_native_scale(wl_resource_get_client(s->resource))) return BROOK_WL_SCALE_ONE;
     return fractional?g_output_scale120:g_output_scale*BROOK_WL_SCALE_ONE;
 }
 static wl_fixed_t surface_pointer_fixed(const struct brook_surface *s,int32_t physical) {
@@ -716,6 +760,14 @@ static void toplevel_apply_fullscreen(struct brook_surface *s) {
     fprintf(stderr,"[waylandd] xdg_toplevel fullscreen=%d wm=%u rc=%ld\n",s->want_fullscreen,s->wm_id,rc);
 }
 static int capture_excluded(const struct brook_surface *surface);
+struct brook_draw;
+static int nv_layer_present(struct brook_surface *root,struct brook_draw *draws,unsigned count);
+static int nv_layer_materialize(struct brook_surface *root,struct brook_draw *draws,unsigned count);
+static void nv_layer_detach(struct brook_surface *root);
+static void nv_layer_forget(struct brook_surface *s);
+struct brook_buffer;struct brook_dmabuf_buffer;
+static int nv_layer_candidate(const struct brook_surface *s,const struct brook_dmabuf_buffer *db);
+static struct brook_image *nv_layer_image(struct brook_buffer *buffer,int *uncertain);
 #include "surface-scene.h"
 static struct brook_image *intel_dmabuf_snapshot(const struct brook_dmabuf_buffer *db,int *uncertain);
 static struct brook_image *intel_dmabuf_defer(struct brook_buffer *buffer);
@@ -1348,6 +1400,12 @@ static void surface_commit(struct wl_client *c,struct wl_resource *r) {
                                             trace_attachment, buffer->trace_cycle, trace_surface, buffer->uses, NULL);
                     buffer_release(buffer);
                 }
+            } else if (db->nv_bo && nv_layer_candidate(s,db)) {
+                /* nv-drm, zero-copy step 2: wait for the producer, then hold the buffer. */
+                buffer_begin_use(buffer);
+                int uncertain=0;image=nv_layer_image(buffer,&uncertain);
+                if(uncertain)buffer->uncertain=1;
+                if(!image)buffer_release(buffer);
             } else if (db->nv_bo) {
                 /* nv-drm: wait for the producer's implicit fence, then CPU snapshot. */
                 buffer_begin_use(buffer);
@@ -2506,13 +2564,13 @@ static void output_refresh(uint32_t now) {
         output_send_size(o->resource);
         if (wl_resource_get_version(o->resource)>=2) {
             if (previous_legacy!=g_output_scale)
-                wl_output_send_scale(o->resource,xwayland?1:g_output_scale);
+                wl_output_send_scale(o->resource,xwayland || client_native_scale(wl_resource_get_client(o->resource))?1:g_output_scale);
             wl_output_send_done(o->resource);
         }
     }
     if (scale_changed) {
         for (struct brook_surface *surface=g_surfaces; surface; surface=surface->next)
-            if (surface->fractional_scale)
+            if (surface->fractional_scale && !client_native_scale(wl_resource_get_client(surface->fractional_scale)))
                 wp_fractional_scale_v1_send_preferred_scale(surface->fractional_scale,g_output_scale120);
     }
 }
@@ -2546,7 +2604,7 @@ static void output_bind(struct wl_client *client, void *data,
 
     output_send_size(r);
     if (version >= 2) {
-        wl_output_send_scale(r, client==g_xwayland_client?1:g_output_scale);
+        wl_output_send_scale(r, client==g_xwayland_client || client_native_scale(client)?1:g_output_scale);
         if (version >= 4) {
             wl_output_send_name(r, "BROOK-1");
             wl_output_send_description(r, "Brook virtual display");
@@ -3500,7 +3558,7 @@ static void fractional_get(struct wl_client *client,struct wl_resource *manager,
     }
     surface->fractional_scale=resource;
     wl_resource_set_implementation(resource,&fractional_impl,surface,fractional_resource_destroyed);
-    wp_fractional_scale_v1_send_preferred_scale(resource,g_output_scale120);
+    wp_fractional_scale_v1_send_preferred_scale(resource,client_native_scale(client)?BROOK_WL_SCALE_ONE:g_output_scale120);
 }
 
 static const struct wp_fractional_scale_manager_v1_interface fractional_manager_impl={
@@ -4042,6 +4100,126 @@ static struct brook_image *nv_dmabuf_snapshot(const struct brook_dmabuf_buffer *
         db->fourcc==0x34325258?WL_SHM_FORMAT_XRGB8888:WL_SHM_FORMAT_ARGB8888);
     if (image) { g_layer_readback_bytes+=(uint64_t)db->width*db->height*4;++g_nv_snapshots; }
     return image;
+}
+
+/* ---- Zero-copy step 2: show the client's GART BO directly (WM_SET_NV_LAYER).
+ * A plain xdg toplevel (no subsurfaces, viewport, transform or server-drawn caption strip)
+ * committing an XRGB nv dmabuf keeps the wl_buffer instead of a CPU snapshot: once the
+ * producer fence is done, surface_render hands the BO to the kernel when it is 1:1 with the
+ * window. The kernel then copies it to scanout with the copy engine (or the compositor reads
+ * it, when the window is covered), and the wl_buffer is released when a newer buffer
+ * replaces it there. Anything else snapshots it as before. Off with BROOK_WAYLAND_NV_LAYER=0
+ * or /etc/waylandd-nv-no-layer. */
+#define BROOK_SYS_WM_SET_NV_LAYER 0xB2B
+static uint64_t g_nv_layer_sets,g_nv_layer_materialized,g_nv_layer_detaches,g_nv_layer_failed;
+static int nv_layer_wanted(void){
+    static int wanted=-1;
+    if(wanted<0){const char *v=getenv("BROOK_WAYLAND_NV_LAYER");
+        wanted=v?strcmp(v,"0")!=0:access("/etc/waylandd-nv-no-layer",F_OK)!=0;}
+    return wanted;
+}
+static struct brook_nv_import *nv_import_find(uint32_t bo){
+    struct brook_nv_import *e=g_nv_imports;
+    while (e && e->bo!=bo) e=e->next;
+    return e;
+}
+static int nv_layer_candidate(const struct brook_surface *s,const struct brook_dmabuf_buffer *db){
+    return nv_layer_wanted() && db->nv_bo && db->fourcc==0x34325258 && s->xdg_toplevel && !s->subsurface_parent &&
+           !s->children && !s->viewport && !s->is_cursor && s->role==1 && !s->geometry.transform && s->deco_sent_mode!=2;
+}
+/* Wait for the producer (as nv_dmabuf_snapshot), then an image that holds the buffer. */
+static struct brook_image *nv_layer_image(struct brook_buffer *buffer,int *uncertain){
+    *uncertain=0;
+    const struct brook_dmabuf_buffer *db=buffer->dmabuf;
+    struct brook_nv_import *e=nv_import_find(db->nv_bo);
+    if (!e) return NULL;
+    const uint64_t t0=nv_now_us();
+    for (;;) {
+        struct drm_nouveau_gem_cpu_prep prep={e->bo,NOUVEAU_GEM_CPU_PREP_NOWAIT};
+        if (!ioctl(g_nv_fd,DRM_IOCTL_NOUVEAU_GEM_CPU_PREP,&prep)) break;
+        const int error=errno;
+        if (error==EINTR) continue;
+        if (error!=EBUSY || nv_now_us()-t0>NV_DMABUF_WAIT_MS*1000u) {
+            *uncertain=1;
+            fprintf(stderr,"[waylandd] nv dmabuf: producer fence %s (errno=%d); release withheld\n",
+                    error==EBUSY?"timed out":"failed",error);
+            return NULL;
+        }
+        usleep(200);
+    }
+    const uint64_t waited=nv_now_us()-t0;
+    if (waited>g_nv_wait_us_max) g_nv_wait_us_max=waited;
+    struct brook_image *image=calloc(1,sizeof(*image));
+    if (!image) return NULL;
+    image->refs=1;image->width=db->width;image->height=db->height;image->format=2;image->opaque=1;
+    image->nv_layer=1;image->source=buffer;++buffer->refs;   /* the caller's buffer_begin_use is this image's */
+    return image;
+}
+static long nv_layer_syscall(uint32_t wm,const struct brook_image *image){
+    if (!image) return syscall(BROOK_SYS_WM_SET_NV_LAYER,(long)wm,0L,0L,0L,0L,0L);
+    const struct brook_dmabuf_buffer *db=image->source->dmabuf;
+    const struct brook_nv_import *e=nv_import_find(db->nv_bo);
+    if (!e) { errno=ENOENT;return -1; }
+    return syscall(BROOK_SYS_WM_SET_NV_LAYER,(long)wm,(long)g_nv_fd,(long)(e->map_handle+db->offset),(long)db->stride,
+                   (long)((uint32_t)db->width|((uint32_t)db->height<<16)),1L);
+}
+/* 1 = the window now shows this layer (nothing else to publish), 0 = not applicable. */
+static int nv_layer_present(struct brook_surface *root,struct brook_draw *draws,unsigned count){
+    if (count!=1 || draws[0].x || draws[0].y || !root->wm_id || g_nv_fd<0) return 0;
+    struct brook_image *image=draws[0].view->image;
+    const struct brook_geometry *g=&draws[0].view->geometry;
+    const uint32_t scale=surface_output_scale(root);
+    if (!image->nv_layer || image->pixels || !image->source || !image->source->dmabuf || g->transform || g->sx || g->sy ||
+        g->sw!=(int64_t)image->width*256 || g->sh!=(int64_t)image->height*256 ||
+        logical_to_physical(g->w,scale)!=image->width || logical_to_physical(g->h,scale)!=image->height ||
+        root->vfb_w!=image->width || root->vfb_h!=image->height) return 0;
+    if (root->nv_layer_image==image) return 1;   /* a metadata-only commit */
+    if (nv_layer_syscall(root->wm_id,image)) {
+        if (!g_nv_layer_failed++) fprintf(stderr,"[waylandd] nv layer: WM_SET_NV_LAYER failed (%s); CPU snapshots\n",strerror(errno));
+        return 0;
+    }
+    /* The kernel no longer reads the previous layer: its buffer may go back to the client. */
+    struct brook_image *old=root->nv_layer_image;
+    image_ref(image);root->nv_layer_image=image;image_unref(old);
+    if (!g_nv_layer_sets++) fprintf(stderr,"[waylandd] nv layer: wm=%u %ux%u stride=%u shown directly\n",root->wm_id,
+                                    image->width,image->height,image->source->dmabuf->stride);
+    surface_layer_trace(root,draws,count,LAYER_PATH_SINGLE);
+    return 1;
+}
+/* Give every held nv layer image in the scene its pixels (a CPU snapshot of the BO, as
+ * nv_dmabuf_snapshot), releasing the buffer now unless the kernel still shows it. */
+static int nv_layer_materialize(struct brook_surface *root,struct brook_draw *draws,unsigned count){
+    for (unsigned i=0;i<count;++i) {
+        struct brook_image *image=draws[i].view->image;
+        if (!image->nv_layer || image->pixels || !image->source || !image->source->dmabuf) continue;
+        const struct brook_dmabuf_buffer *db=image->source->dmabuf;
+        struct brook_nv_import *e=nv_import_find(db->nv_bo);
+        if (!e) return 0;
+        if (!e->map) {
+            void *m=mmap(NULL,(size_t)e->size,PROT_READ,MAP_SHARED,g_nv_fd,(off_t)e->map_handle);
+            if (m==MAP_FAILED) { fprintf(stderr,"[waylandd] nv dmabuf: mmap failed: %s\n",strerror(errno));return 0; }
+            e->map=m;
+        }
+        struct brook_image *copy=image_snapshot(e->map+db->offset,db->width,db->height,db->stride,WL_SHM_FORMAT_XRGB8888);
+        if (!copy) return 0;
+        image->pixels=copy->pixels;copy->pixels=NULL;image_unref(copy);
+        g_layer_readback_bytes+=(uint64_t)db->width*db->height*4;++g_nv_snapshots;++g_nv_layer_materialized;
+        if (image!=root->nv_layer_image) {
+            struct brook_buffer *b=image->source;image->source=NULL;
+            buffer_release(b);buffer_drop(b);
+        }
+    }
+    return 1;
+}
+static void nv_layer_detach(struct brook_surface *root){
+    if (!root->nv_layer_image) return;
+    if (root->wm_id) (void)nv_layer_syscall(root->wm_id,NULL);
+    struct brook_image *old=root->nv_layer_image;root->nv_layer_image=NULL;image_unref(old);
+    ++g_nv_layer_detaches;
+}
+/* The window is gone (the kernel dropped its layer with it). */
+static void nv_layer_forget(struct brook_surface *s){
+    struct brook_image *old=s->nv_layer_image;s->nv_layer_image=NULL;image_unref(old);
 }
 
 /* The Wayland buffer ownership contract excludes new producer writes until
@@ -5326,7 +5504,10 @@ static void waylandd_status_write(const char *display){
                 image->offer_state, image->producer_fence >= 0, image->group_refs,
                 image->source ? image->source->uses : 0, image->refs, image->offer_identity.window);
     }
-    fprintf(f, "]},\"readback_bytes\":%llu,\"paths\":{",g_layer_readback_bytes);
+    fprintf(f, "]},\"nv_layer\":{\"sets\":%llu,\"materialized\":%llu,\"detaches\":%llu,\"failed\":%llu,\"snapshots\":%llu,\"imported\":%llu},",
+            (unsigned long long)g_nv_layer_sets,(unsigned long long)g_nv_layer_materialized,(unsigned long long)g_nv_layer_detaches,
+            (unsigned long long)g_nv_layer_failed,(unsigned long long)g_nv_snapshots,(unsigned long long)g_nv_imported);
+    fprintf(f, "\"readback_bytes\":%llu,\"paths\":{",g_layer_readback_bytes);
     for(unsigned i=0;i<LAYER_PATHS;++i)fprintf(f,"%s\"%s\":%llu",i?",":"",g_layer_path_names[i],g_layer_paths[i]);
     fprintf(f,"},\"windows\":[");
     int first=1;

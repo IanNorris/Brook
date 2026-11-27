@@ -10,6 +10,7 @@
 // blitting client areas to draw the window decorations.
 
 #include "window.h"
+#include "nv_layer.h"
 #include "keyboard.h"
 #include "../../shared/input_preferences.h"
 #include "idle_inhibit.h"
@@ -1319,6 +1320,7 @@ static void DestroyWindowLocked(int idx)
     }
     w.externalCaptured = false;
     w.externalW = w.externalH = 0;
+    NvLayerDetach(static_cast<uint32_t>(idx), w.creationIdentity); // its NVK client layer, if any
     if (w.idleInhibitors) SerialPrintf("WM: window %d idle inhibitors %u -> 0 (destroyed)\n", idx, w.idleInhibitors);
     w.idleInhibitors = 0;
     w.wmId = 0;
@@ -3942,6 +3944,30 @@ uint64_t WmMapWindowVfb(Process* caller,uint32_t wmId) {
         }
     }
     return 0;
+}
+
+// Zero-copy step 2 (WM_SET_NV_LAYER): the owner's window identity, then, after the layer
+// is set, publish it like a VFB commit (the compositor shows the layer from now on).
+bool WmNvLayerTarget(Process* proc, uint32_t wmId, uint64_t* identity)
+{
+    VfbGuard guard;
+    Window* w = WmFindWindowById(proc, wmId);
+    if (!w || !w->vfb) return false;
+    *identity = w->creationIdentity;
+    return true;
+}
+bool WmNvLayerPublish(Process* proc, uint32_t wmId, uint64_t identity)
+{
+    VfbGuard guard;
+    Window* w = WmFindWindowById(proc, wmId);
+    if (!w || w->creationIdentity != identity) return false;
+    w->sourceWriteActive=false;
+    w->externalCaptured = false;
+    w->publishedGeneration=NextPublication(*w);
+    w->externalW = w->externalH = 0;
+    w->vfbDirty = 1;
+    CompositorWake();
+    return true;
 }
 
 void WmSignalDirtyById(Process* proc, uint32_t wmId)

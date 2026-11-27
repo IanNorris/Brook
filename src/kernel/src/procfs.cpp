@@ -176,6 +176,8 @@ struct ProcPriv {
     uint8_t mapKind; // 1 UID, 2 GID, 3 setgroups; independent namespace lease
     bool sysKernelDirectory;
     bool commandLine;
+    bool environment;     // /proc/<pid>/environ (commandLine set too): the environment strings
+    uint32_t ownerUid;    // environ: readable by root or this uid only
     bool residentStatusPending;
     KMutex residentStatusLock;
     uint64_t reportedOwner;
@@ -229,6 +231,10 @@ static int ProcFileRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
 {
     auto* pp = static_cast<ProcPriv*>(vn->priv);
     if (pp && pp->commandLine) {
+        if (pp->environment) {   // Linux: PTRACE_MODE_READ; here: root or the same uid
+            Process* reader=ProcessCurrent();
+            if (!reader || (reader->euid && reader->euid!=pp->ownerUid)) return -13;
+        }
         struct ReadOperation {
             Process* actor=ProcessCurrent();
             ReadOperation() { if(actor)SchedulerKernelRegionEnter(actor); }
@@ -241,7 +247,7 @@ static int ProcFileRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
         const uint32_t capacity=len>EXEC_ARG_BYTES?EXEC_ARG_BYTES:static_cast<uint32_t>(len);
         auto* staged=static_cast<uint8_t*>(kmalloc(capacity));
         if (!staged) { AddressSpaceUnref(space);return -12; }
-        const uint32_t copied=UserMappingReadArguments(space,*offset,staged,capacity);
+        const uint32_t copied=UserMappingReadArguments(space,*offset,staged,capacity,false,pp->environment);
         AddressSpaceUnref(space);
         // Destination can fault; no foreign AS gate or frame reference is held.
         uint32_t delivered=copied;
@@ -887,6 +893,17 @@ static Vnode* GenPidWchan(const ProcessSnapshot& proc)
 }
 
 // /proc/[pid]/cmdline — live NUL-separated arguments, tied to PID incarnation.
+// /proc/[pid]/environ: the exec environment (NUL-separated), for root or the same uid
+// (waylandd reads BROOK_WAYLAND_NATIVE_SCALE from Wayland clients).
+static Vnode* GenPidEnviron(const ProcessSnapshot& proc)
+{
+    auto* node=MakeProcVnode(nullptr,0);
+    if (node) {
+        auto* pp=static_cast<ProcPriv*>(node->priv);
+        pp->commandLine=true;pp->environment=true;pp->ownerUid=proc.euid;pp->pid=proc.pid;pp->incarnation=proc.incarnation;
+    }
+    return node;
+}
 static Vnode* GenPidCmdline(const ProcessSnapshot& proc)
 {
     auto* node=MakeProcVnode(nullptr,0);
@@ -1636,6 +1653,7 @@ static ProcPidEntry g_pidEntries[] = {
     { "cgroup",  GenPidCgroup },
     { "syscall", GenPidSyscall },
     { "wchan",   GenPidWchan },
+    { "environ", GenPidEnviron },   // appended: retained entry indices stay valid
 };
 static constexpr uint32_t NUM_PID_ENTRIES = sizeof(g_pidEntries) / sizeof(g_pidEntries[0]);
 

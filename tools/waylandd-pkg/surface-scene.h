@@ -40,6 +40,9 @@ struct brook_image {
     uint64_t buffer_trace_epoch, buffer_trace_attachment, buffer_trace_cycle;
     unsigned buffer_trace_serial, buffer_trace_surface;
     int buffer_trace_producer_ready, buffer_trace_offer_ack;
+    /* Zero-copy step 2: an nv-drm (renderD130) dmabuf held, not copied. source is the
+     * wl_buffer (released with the image); pixels stay NULL until nv_layer_materialize. */
+    int nv_layer;
 };
 static void image_buffer_trace(const struct brook_image *image, enum buffer_trace_kind kind,
                                const struct BrookGpuWindowIdentity *offer)
@@ -176,7 +179,8 @@ static void surface_unmap(struct brook_surface *s) {
     memset(&s->size_hints,0,sizeof(s->size_hints));memset(&s->pending_size_hints,0,sizeof(s->pending_size_hints));s->size_hints_pending=0;
     s->toplevel_maximized=s->toplevel_resizing=s->toplevel_fullscreen=0;s->configure_width=s->configure_height=0;s->configure_size_pending=s->configure_size_acked=0;s->configure_size_serial=0;
     scene_owner_unref(s->scene);s->scene=NULL;s->scene_disabled=0;
-    if (s->wm_id) wm_destroy_window(s->wm_id);
+    if (s->wm_id) wm_destroy_window(s->wm_id);   /* the kernel detaches its nv layer */
+    nv_layer_forget(s);
     s->idle_inhibit_sent=0; /* the kernel drops the count with the window */
     s->wm_id=0;s->native_focused=0;s->vfb=NULL;s->vfb_w=s->vfb_h=s->vfb_stride=0;s->deco_sent_mode=-1;
     s->strip_due=3;s->strip_trailing=0;s->strip_style=0;strip_retry_drop(s);
@@ -406,6 +410,12 @@ static int surface_render(struct brook_surface *root) {
     if (!surface_window(root,base)) return 0;
     if (!root->wm_id || !root->vfb) return 1;
     if (!scene_ensure(root)) return 0;
+    /* Zero-copy step 2: one 1:1 nv dmabuf layer is handed to the kernel instead of copied;
+     * anything else needs its pixels (and publishes the VFB, which detaches the layer). */
+    if (!root->scene) {
+        if (nv_layer_present(root,draws,count)) return 1;
+        if (!nv_layer_materialize(root,draws,count)) return 0;
+    }
     const uint32_t scale=surface_output_scale(root);
     /* Match the native scene-service bound in both backends, including
      * partially visible subsurfaces rather than only the root window. */
@@ -503,6 +513,7 @@ static int surface_render(struct brook_surface *root) {
     surface_layer_trace(root,draws,count,gpuComposed?LAYER_PATH_VULKAN:LAYER_PATH_GENERAL);
     brook_straight_rows(root->vfb,root->vfb_stride,root->composite,root->vfb_w,root->vfb_w,root->vfb_h);
 publish:;
+    nv_layer_detach(root);   /* the VFB now holds the window: stop showing the old layer */
     int tagged=0;
 #ifdef BROOK_WAYLAND_SOURCE_COMMIT_TAG
     /* Tag only when the composed snapshot includes the current root view.

@@ -616,6 +616,7 @@ static uint64_t SetupUserStack(Process* proc,
     // ProcessCreate/ProcessExec validate counts and byte budgets before
     // allocating or replacing the address space. Preserve every entry.
     uint64_t envAddrs[EXEC_MAX_ENV] = {};
+    const uint64_t environmentEnd = sp;
     for (int i = envc - 1; i >= 0; --i)
     {
         uint64_t len = 0;
@@ -635,6 +636,7 @@ static uint64_t SetupUserStack(Process* proc,
     KMutexLock(&proc->addressSpace->mutation);
     proc->addressSpace->argumentStart = sp;
     proc->addressSpace->argumentEnd = argumentEnd;
+    proc->addressSpace->environmentEnd = environmentEnd;
     KMutexUnlock(&proc->addressSpace->mutation);
 
     // 4. Align to 16 bytes

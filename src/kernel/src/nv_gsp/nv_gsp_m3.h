@@ -48,7 +48,28 @@ inline uint32_t CeCopyWords(uint32_t* w, const CeRect& r, bool bind) {
     return n;
 }
 
-constexpr uint64_t kM3VaS = 0x0000003000000000ull, kM3VaR = 0x0000003100000000ull,
+// The same copy of 32-bit pixels with alpha forced to 255 (zero-copy step 2: an XRGB client
+// buffer, whose X byte is undefined, into an A8R8G8B8 scanout surface). Component remap
+// (cl90b5.h): 4 one-byte components in and out, DST_X/Y/Z = SRC_X/Y/Z, DST_W = CONST_A; with
+// remap on, LINE_LENGTH_IN counts pixels (NVK nvk_cmd_copy.c). 15 words.
+namespace ce {
+constexpr uint32_t SET_REMAP_CONST_A = 0x0700, LAUNCH_REMAP = 1u << 10;
+constexpr uint32_t kRemapOpaque = 0u | (1u << 4) | (2u << 8) | (4u << 12) | (0u << 16) | (3u << 20) | (3u << 24);
+}
+inline uint32_t CeOpaqueCopyWords(uint32_t* w, const CeRect& r) {
+    namespace h = rm570::host;
+    uint32_t n = 0;
+    w[n++] = h::IncHeader(ce::kSubc, ce::SET_REMAP_CONST_A, 3);
+    w[n++] = 0xff; w[n++] = 0; w[n++] = ce::kRemapOpaque;
+    w[n++] = h::IncHeader(ce::kSubc, ce::OFFSET_IN_UPPER, 8);
+    w[n++] = uint32_t(r.src >> 32) & 0xff; w[n++] = uint32_t(r.src);
+    w[n++] = uint32_t(r.dst >> 32) & 0xff; w[n++] = uint32_t(r.dst);
+    w[n++] = r.src_pitch; w[n++] = r.dst_pitch; w[n++] = r.line_bytes / 4; w[n++] = r.lines;
+    w[n++] = h::IncHeader(ce::kSubc, ce::LAUNCH_DMA, 1); w[n++] = ce::kLaunchPitch2D | ce::LAUNCH_REMAP;
+    return n;
+}
+
+constexpr uint64_t kM3VaS =0x0000003000000000ull, kM3VaR = 0x0000003100000000ull,
                    kM3VaV1 = 0x0000003200000000ull, kM3VaV2 = 0x0000003300000000ull;
 
 struct M3Buf { uint8_t* cpu = nullptr; uint64_t bus = 0; uint64_t bytes = 0; };

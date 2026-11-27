@@ -1,6 +1,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include "../../kernel/src/window.cpp"
+namespace brook { void NvLayerDetach(uint32_t, uint64_t) {} }   // zero-copy step 2 layer table (nv_layer.cpp) is not linked here
 #include "../../kernel/src/chrome_raster.cpp"
 #include "../../kernel/src/chrome_frame.cpp"
 #include "../../kernel/src/chrome_shell.cpp"

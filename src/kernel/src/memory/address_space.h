@@ -50,6 +50,7 @@ struct AddressSpaceState {
     uint64_t savedAuxv[SavedAuxvWords];
     uint32_t savedAuxvWords;
     uint64_t argumentStart, argumentEnd; // live, contiguous exec argument strings; mutation protects reads
+    uint64_t environmentEnd;             // the environment strings follow at [argumentEnd, environmentEnd)
     // Irreversible for this AS identity. Registry guard serializes publication
     // of every user sharing task with OOM selection, including non-thread clones.
     bool oomTerminating;

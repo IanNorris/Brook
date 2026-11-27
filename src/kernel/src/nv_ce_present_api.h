@@ -16,6 +16,12 @@ struct NvCeJob {
     uint32_t dst_pitch;            // bytes
     const NvCeRect* rects;         // output-local, already clipped by the caller or clipped here
     uint32_t n;
+    // Zero-copy step 2: one more copy after the rectangles, from a physically contiguous
+    // sysmem buffer (a client's GART BO) to `layer_dst` (output-local), alpha forced to 255.
+    // layer_phys 0 = none. The copy is the last one, so it wins over any rect overlapping it.
+    uint64_t layer_phys = 0;       // the pixel at layer_dst's top-left
+    uint32_t layer_stride = 0;     // bytes
+    NvCeRect layer_dst{};
 };
 // kick: 1 = kicked (*ticket; the copy runs while the caller continues), 0 = not available
 //       (CPU copies), -1 = failed (CPU copies; CE now off).

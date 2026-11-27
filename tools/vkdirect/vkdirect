@@ -17,5 +17,8 @@ if [ ! -e /etc/waylandd-nv-dmabuf ]; then
     echo "vkdirect: /etc/waylandd-nv-dmabuf is not set; keeping the staged (sw) presentation" >&2
     exec "$@"
 fi
-export MESA_VK_WSI_DEBUG= BROOK_VULKAN_PRESENTATION=direct
+# Native scale (zero-copy step 2): waylandd configures this client in physical pixels, so its
+# buffers are 1:1 with its window and the kernel can copy them straight to scanout. Fullscreen
+# games cover the output 1:1; windowed test clients look small on a HiDPI desktop.
+export MESA_VK_WSI_DEBUG= BROOK_VULKAN_PRESENTATION=direct BROOK_WAYLAND_NATIVE_SCALE=1
 exec "$@"

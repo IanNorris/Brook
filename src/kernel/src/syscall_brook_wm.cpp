@@ -26,6 +26,9 @@
 #include "../../shared/brook_experience_config.h"
 #include "../../shared/brook_outputs.h"
 #include "display_output.h"
+#include "nv_layer.h"
+#include "nv_drm.h"
+#include "../../shared/wm_nv_layer_abi.h"
 
 namespace brook {
 
@@ -603,6 +606,40 @@ int64_t sys_brook_wm_exclude_capture(uint64_t wmId, uint64_t, uint64_t,
     if (!proc) return -ESRCH;
     if (!wmId || wmId > WM_MAX_WINDOWS) return -EINVAL;
     return brook::WmExcludeOwnedWindowFromCapture(proc, static_cast<uint32_t>(wmId)) ? 0 : -ENOENT;
+}
+
+// 0xB2B: WM_SET_NV_LAYER (zero-copy step 2; see shared/wm_nv_layer_abi.h).
+int64_t sys_brook_wm_set_nv_layer(uint64_t wmId, uint64_t fd, uint64_t offset,
+                                  uint64_t stride, uint64_t size, uint64_t flags)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    if (!wmId || wmId > WM_MAX_WINDOWS || (flags & ~uint64_t(BROOK_WM_NV_LAYER_ATTACH))) return -EINVAL;
+    uint64_t identity = 0;
+    if (!brook::WmNvLayerTarget(proc, static_cast<uint32_t>(wmId), &identity)) return -ENOENT;
+    const uint32_t slot = static_cast<uint32_t>(wmId) - 1;
+    if (!(flags & BROOK_WM_NV_LAYER_ATTACH)) { brook::NvLayerDetach(slot, identity); return 0; }
+    const uint32_t w = uint32_t(size & 0xffff), h = uint32_t((size >> 16) & 0xffff);
+    if (!w || !h || w > 16384 || h > 16384 || (size >> 32) || (stride & 3) || (offset & 3) ||
+        stride < uint64_t(w) * 4 || stride > (1u << 20)) return -EINVAL;
+    if (fd >= MAX_FDS) return -EBADF;
+    uint64_t phys = 0;
+    brook::MappingBacking* life = nullptr;
+    {
+        FdRef ref(proc, static_cast<int>(fd));
+        if (!ref || ref->type != FdType::DevNvDri || !ref->handle) return -EBADF;
+        const uint64_t length = stride * (h - 1) + uint64_t(w) * 4;
+        if (!brook::NvDrmMapGart(static_cast<brook::NvDrmFile*>(ref->handle), offset, length, &phys, &life)) return -EINVAL;
+    }
+    brook::NvLayer next{};
+    next.phys = phys; next.stride = uint32_t(stride); next.w = w; next.h = h; next.life = life;
+    (void)brook::NvLayerSet(slot, identity, next);
+    // Lost a race with the window's destruction: drop what was just attached.
+    if (!brook::WmNvLayerPublish(proc, static_cast<uint32_t>(wmId), identity)) {
+        brook::NvLayerDetach(slot, identity);
+        return -ENOENT;
+    }
+    return 0;
 }
 
 // 0xB27: WM_SET_IDLE_INHIBIT(wmId, count)

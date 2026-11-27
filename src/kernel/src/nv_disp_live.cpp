@@ -10,6 +10,8 @@
 #include "nv_disp_head_runner.h"
 #include "nv_disp_driver.h"
 #include "nv_ce_present_api.h"
+#include "nv_disp_hole.h"
+#include "nv_layer.h"
 #if defined(BROOK_NV_GSP)
 #include "nv_gsp_live.h"
 #endif
@@ -235,6 +237,11 @@ struct NvPresenterState{
     // A kicked copy (shadow -> px[ceBb]) not yet flipped; its rectangles for a CPU fallback.
     bool ceInflight=false,shadowContig=false;int8_t ceBb=-1;uint32_t ceTicket=0,ceN=0;NvCeRect ceRects[100]{};
     uint64_t ceWaitNs=0,ceKicks=0,ceFlipsFromPoll=0;
+    // Zero-copy step 2 (head 0): the hole (output-local; empty = none) and whose layer fills it,
+    // the layer frame (seq) the last flip copied, and, for the kicked copy, the layer it reads.
+    DamageRect hole{};uint32_t holeSlot=0;uint64_t holeIdentity=0,holeSeqFlipped=0;bool holeFlipped=false;
+    bool ceLayer=false;DamageRect ceLayerRect{};uint64_t ceLayerPhys=0;uint32_t ceLayerStride=0;
+    uint64_t directFrames=0,layerCeFrames=0,layerCpuFrames=0,holeRepairs=0,layerMissing=0,layerVerified=0;
 };
 NvPresenterState g_presenter[nvdisp::kDriverOutputs]{};
 const NvCeOps* g_ceOps=nullptr;       // set/cleared under the nv-aux lock
@@ -292,6 +299,9 @@ bool CeFinishLocked(uint32_t budgetUs){
         return *x1>*x0&&*y1>*y0;};
     auto cpu=[&](const NvCeRect& q){int32_t x0,y0,x1,y1;if(!clip(q,&x0,&y0,&x1,&y1))return;
         for(int32_t y=y0;y<y1;++y)__builtin_memcpy(dst+uint64_t(y)*pitch+x0,p.shadow+uint64_t(y)*width+x0,uint64_t(x1-x0)*4);};
+    // The layer is still held: its retire (nv_layer.cpp) waits for this function under the lock.
+    const uint32_t* bo=p.ceLayer?reinterpret_cast<const uint32_t*>(PhysToVirt(PhysicalAddress(p.ceLayerPhys)).raw()):nullptr;
+    auto cpuLayer=[&]{if(bo){nvdisp::CopyLayerRect(dst,pitch,p.ceLayerRect,bo,p.ceLayerStride/4);++p.layerCpuFrames;}};
     if(r==1){
         ++p.ceFrames;
         if(p.ceFrames<=300||!(p.ceFrames&63)){
@@ -299,12 +309,19 @@ bool CeFinishLocked(uint32_t budgetUs){
                 const int32_t xs[2]={x0,x1-1},ys[2]={y0,y1-1};
                 for(int a=0;a<2;++a)for(int b2=0;b2<2;++b2){++p.ceVerified;
                     if(dst[uint64_t(ys[b2])*pitch+xs[a]]!=p.shadow[uint64_t(ys[b2])*width+xs[a]]){++p.ceMismatch;g_ceVerifyOff=true;}}}
+            if(bo){const DamageRect& h=p.ceLayerRect;const uint32_t sp=p.ceLayerStride/4;
+                const int32_t xs[2]={h.x0,h.x1-1},ys[2]={h.y0,h.y1-1};
+                for(int a=0;a<2;++a)for(int b2=0;b2<2;++b2){++p.layerVerified;
+                    if(dst[uint64_t(ys[b2])*pitch+xs[a]]!=(bo[uint64_t(ys[b2]-h.y0)*sp+uint32_t(xs[a]-h.x0)]|0xff000000u)){++p.ceMismatch;g_ceVerifyOff=true;}}}
             if(g_ceVerifyOff){KPrintf("nv-display: CE present read-back mismatch; CPU copies from now on\n");
-                for(uint32_t i=0;i<p.ceN;++i)cpu(p.ceRects[i]);}
-        }
+                for(uint32_t i=0;i<p.ceN;++i)cpu(p.ceRects[i]);
+                cpuLayer();}
+            else if(bo)++p.layerCeFrames;
+        }else if(bo)++p.layerCeFrames;
     }else{g_ceOps=nullptr;++p.ceCpuFrames;KPrintf("nv-display: CE present copy failed; CPU copies from now on\n");
-        for(uint32_t i=0;i<p.ceN;++i)cpu(p.ceRects[i]);}
-    p.ceInflight=false;
+        for(uint32_t i=0;i<p.ceN;++i)cpu(p.ceRects[i]);
+        cpuLayer();}
+    p.ceInflight=false;p.ceLayer=false;
     __asm__ volatile("sfence":::"memory");
     if(f.Present(p.ceBb)<0){g_driver.Tick();return true;}
     ++p.frames;NoteFrame(p);
@@ -336,19 +353,44 @@ int FlipPendingLocked(uint32_t o,const uint32_t* src,uint32_t srcStride){
     const bool ce=o==0&&g_ceOps&&!g_ceVerifyOff&&p.shadow&&p.shadowValid;
     if(ce&&p.ceInflight){(void)CeFinishLocked(kCeWaitUs);return 1;}   // that frame flips now; pending waits for the next idle poll
     bool kicked=false;
+    // Zero-copy step 2: the hole is left out of every copy and filled from the window's layer
+    // last (looked up under the nv-aux lock, which its retire takes, so it stays valid until
+    // the copy is finished). A vanished layer leaves the hole as the copies left it.
+    NvLayer layer{};DamageRect lrect{};
+    const DamageRect hole=o==0?p.hole:DamageRect{};
+    if(!hole.empty()){
+        if(NvLayerGet(p.holeSlot,p.holeIdentity,&layer,false)){
+            lrect=DamageRect{hole.x0,hole.y0,hole.x0+int32_t(layer.w),hole.y0+int32_t(layer.h)};
+            if(lrect.x1>hole.x1)lrect.x1=hole.x1;
+            if(lrect.y1>hole.y1)lrect.y1=hole.y1;
+            if(lrect.empty())layer=NvLayer{};
+        }else ++p.layerMissing;
+    }
+    const uint32_t* bo=layer.phys?reinterpret_cast<const uint32_t*>(PhysToVirt(PhysicalAddress(layer.phys)).raw()):nullptr;
+    auto copyOutside=[&](const DamageRect& r){nvdisp::ForEachOutside(r,hole,copy);};
     if(ce){
         // Collect the rectangles and kick one copy from the shadow (== this frame); the flip
         // happens when it lands, while the compositor composes the next frame. More than
-        // 100 rectangles, or a refused kick: the CPU copies them from the back buffer.
-        uint32_t n=0;bool over=false;
-        auto collect=[&](const DamageRect& r){if(n<100)p.ceRects[n++]=NvCeRect{r.x0,r.y0,r.x1,r.y1};else{over=true;copy(r);}};
+        // 100 rectangles (99 with a layer), or a refused kick: the CPU copies them from the
+        // back buffer.
+        uint32_t n=0;bool over=false;const uint32_t cap=bo?99:100;
+        auto collect1=[&](const DamageRect& r){if(n<cap)p.ceRects[n++]=NvCeRect{r.x0,r.y0,r.x1,r.y1};else{over=true;copy(r);}};
+        auto collect=[&](const DamageRect& r){nvdisp::ForEachOutside(r,hole,collect1);};
         (void)p.age.Apply(bb,p.pending,width,height,collect);
         uint64_t ceBytes=0;uint32_t ticket=0;int r=0;
-        if(n&&!over){const NvCeJob job{p.shadow,width,width,height,p.vram[bb],pitch*4,p.ceRects,n};r=g_ceOps->kick(job,&ceBytes,&ticket);}
-        if(r==1){kicked=true;bytes+=ceBytes;p.ceBytes+=ceBytes;++p.ceKicks;p.ceInflight=true;p.ceBb=bb;p.ceTicket=ticket;p.ceN=n;}
+        if((n||bo)&&!over){NvCeJob job{p.shadow,width,width,height,p.vram[bb],pitch*4,p.ceRects,n};
+            if(bo){job.layer_phys=layer.phys;job.layer_stride=layer.stride;job.layer_dst=NvCeRect{lrect.x0,lrect.y0,lrect.x1,lrect.y1};}
+            r=g_ceOps->kick(job,&ceBytes,&ticket);}
+        if(r==1){kicked=true;bytes+=ceBytes;p.ceBytes+=ceBytes;++p.ceKicks;p.ceInflight=true;p.ceBb=bb;p.ceTicket=ticket;p.ceN=n;
+            p.ceLayer=bo!=nullptr;p.ceLayerRect=lrect;p.ceLayerPhys=layer.phys;p.ceLayerStride=layer.stride;}
         else{if(r<0){g_ceOps=nullptr;KPrintf("nv-display: CE present kick failed; CPU copies from now on\n");}
-            if(n)++p.ceCpuFrames;for(uint32_t i=0;i<n;++i)copy(DamageRect{p.ceRects[i].x0,p.ceRects[i].y0,p.ceRects[i].x1,p.ceRects[i].y1});}
-    }else (void)p.age.Apply(bb,p.pending,width,height,copy);
+            if(n)++p.ceCpuFrames;for(uint32_t i=0;i<n;++i)copy(DamageRect{p.ceRects[i].x0,p.ceRects[i].y0,p.ceRects[i].x1,p.ceRects[i].y1});
+            if(bo){nvdisp::CopyLayerRect(dst,pitch,lrect,bo,layer.stride/4);++p.layerCpuFrames;bytes+=uint64_t(lrect.x1-lrect.x0)*4*uint32_t(lrect.y1-lrect.y0);}}
+    }else{
+        (void)p.age.Apply(bb,p.pending,width,height,copyOutside);
+        if(bo){nvdisp::CopyLayerRect(dst,pitch,lrect,bo,layer.stride/4);++p.layerCpuFrames;bytes+=uint64_t(lrect.x1-lrect.x0)*4*uint32_t(lrect.y1-lrect.y0);}
+    }
+    if(!hole.empty()){p.holeSeqFlipped=layer.seq;p.holeFlipped=true;++p.directFrames;}
     p.pending=DamageRects{};
     __asm__ volatile("sfence":::"memory");
     {const uint64_t c1=PresentNowNs();p.copyNs+=c1-c0;p.copiedBytes+=bytes;if((c1-c0)/1000>p.copyMaxUs)p.copyMaxUs=uint32_t((c1-c0)/1000);}
@@ -365,6 +407,17 @@ int FlipPendingLocked(uint32_t o,const uint32_t* src,uint32_t srcStride){
 // (D2's mailbox rendered such frames into the third buffer, which then needed the whole
 // drag history: 10-16 ms copies). `src` is the output's top-left pixel in the
 // compositor back buffer; `damageIn` is output-local.
+// Zero-copy step 2: the hole the compositor asked for this frame (compositor thread; applied
+// by the next head-0 present that gets the lock).
+CompositorDirectHole g_holeReq{};bool g_holeReqOn=false;
+volatile bool g_directOff=false;   // `nv-disp direct off`: windows are composed as before
+// The layer filling the hole has a frame the last flip did not copy, or the hole changed.
+bool HoleNeedsFlip(const NvPresenterState& p){
+    if(p.hole.empty())return false;
+    if(!p.holeFlipped)return true;
+    NvLayer l{};
+    return NvLayerGet(p.holeSlot,p.holeIdentity,&l,false)&&l.seq!=p.holeSeqFlipped;
+}
 int PresentOutput(uint32_t o,const uint32_t* src,uint32_t srcStride,const DamageRects& damageIn){
     const uint64_t t0=PresentNowNs();
     auto& p=g_presenter[o];
@@ -381,16 +434,29 @@ int PresentOutput(uint32_t o,const uint32_t* src,uint32_t srcStride,const Damage
     // Only what really changed against the shadow goes over the link (D3).
     DamageRects changed;
     const uint64_t d0=PresentNowNs();
+    if(o==0){
+        // Zero-copy step 2: take the requested hole (clipped to the head). The old one, where
+        // it is no longer a hole, is refreshed into the shadow and rewritten in every buffer.
+        DamageRect want{};
+        if(g_holeReqOn)want=nvdisp::ClipRect(DamageRect{g_holeReq.x0,g_holeReq.y0,g_holeReq.x1,g_holeReq.y1},width,height);
+        const DamageRect was=p.hole;
+        const bool other=!(want==was)||(!want.empty()&&(g_holeReq.slot!=p.holeSlot||g_holeReq.identity!=p.holeIdentity));
+        if(other){
+            if(p.shadow&&p.shadowValid&&nvdisp::RepairHole(src,srcStride,p.shadow,width,width,height,was,DamageRect{},changed))++p.holeRepairs;
+            p.hole=want;p.holeSlot=g_holeReqOn?g_holeReq.slot:0;p.holeIdentity=g_holeReqOn?g_holeReq.identity:0;p.holeFlipped=false;
+        }
+    }
     if(!p.shadow||!p.shadowValid){
         changed=DamageRects::Full(width,height);
         if(p.shadow){for(uint32_t y=0;y<height;++y)__builtin_memcpy(p.shadow+uint64_t(y)*width,src+uint64_t(y)*srcStride,uint64_t(width)*4);p.shadowValid=true;}
     }else{
         if(input.full){input=DamageRects::Rows(0,height,width);++p.fullDiffs;}
-        for(uint32_t i=0;i<input.count;++i)p.compared+=nvdisp::ShadowDiff(src,srcStride,p.shadow,width,width,height,input.rects[i],changed);
+        const DamageRect hole=o==0?p.hole:DamageRect{};
+        for(uint32_t i=0;i<input.count;++i)p.compared+=nvdisp::HoleDiff(src,srcStride,p.shadow,width,width,height,input.rects[i],hole,changed);
     }
     p.diffNs+=PresentNowNs()-d0;
     p.pending.AddAll(changed);
-    if(p.pending.empty()&&!p.pending.full){++p.unchanged;SpinLockRelease(lock);NoteCpu(p,t0);return 0;}
+    if(p.pending.empty()&&!p.pending.full&&!(o==0&&HoleNeedsFlip(p))){++p.unchanged;SpinLockRelease(lock);NoteCpu(p,t0);return 0;}
     if(changed.empty()&&!changed.full)++p.unchanged;
     if(f.state==nvdisp::FlipState::Armed||(o==0&&__atomic_load_n(&g_head0Fence,__ATOMIC_ACQUIRE))){++p.deferred;SpinLockRelease(lock);NoteCpu(p,t0);return 1;}
     const int r=FlipPendingLocked(o,src,srcStride);
@@ -507,7 +573,7 @@ uint32_t NvPrimaryPoll(){
         // buffer equals the shadow here (between frames), so it is the copy source.
         for(uint32_t o=0;o<2;++o){
             auto& p=g_presenter[o];
-            if(!p.active||!g_driver.Live(o)||(p.pending.empty()&&!p.pending.full)||g_driver.f[o].state!=nvdisp::FlipState::Idle||p.ceInflight)continue;
+            if(!p.active||!g_driver.Live(o)||(p.pending.empty()&&!p.pending.full&&!(o==0&&HoleNeedsFlip(p)))||g_driver.f[o].state!=nvdisp::FlipState::Idle||p.ceInflight)continue;
             if(o==0&&__atomic_load_n(&g_head0Fence,__ATOMIC_ACQUIRE))continue;
             uint32_t stride=0;const uint32_t* src=CompositorPresentSource(&stride);
             const uint32_t x=o?uint32_t(__atomic_load_n(&g_head1Rect,__ATOMIC_ACQUIRE)&0xffff):0;
@@ -523,7 +589,28 @@ uint32_t NvPrimaryPoll(){
     const uint64_t d=PresentNowNs()-t0;g_pollNs+=d;++g_polls;if(d/1000>g_pollMaxUs)g_pollMaxUs=uint32_t(d/1000);
     return ms;
 }
-const CompositorPrimaryPresenter g_presenterOps{NvPrimaryPresent,NvPrimaryPoll};
+// Zero-copy step 2 hooks (compositor thread).
+bool NvDirectAvailable(){const auto& p=g_presenter[0];
+    return !g_directOff&&p.active&&p.shadow&&g_ceOps&&!g_ceVerifyOff&&g_driver.Live(0);}
+void NvSetHole(const CompositorDirectHole* h){if(h){g_holeReq=*h;g_holeReqOn=true;}else g_holeReqOn=false;}
+// A captured frame: the hole as the front buffer shows it (through BAR1), alpha forced.
+void NvCaptureHole(uint32_t* dst,uint32_t dstStride,uint32_t width,uint32_t height){
+    SpinLock* lock=NvAuxSharedLock();
+    SpinLockAcquire(lock);
+    const auto& p=g_presenter[0];const auto& f=g_driver.f[0];
+    if(p.active&&g_driver.Live(0)&&!p.hole.empty()&&f.front>=0&&f.front<3&&p.px[f.front]){
+        const DamageRect c=nvdisp::ClipRect(p.hole,width<p.width?width:p.width,height<p.height?height:p.height);
+        const uint32_t* s2=p.px[f.front];
+        for(int32_t y=c.y0;y<c.y1;++y)for(int32_t x=c.x0;x<c.x1;++x)
+            dst[uint64_t(y)*dstStride+x]=s2[uint64_t(y)*p.pitchPx+x]|0xff000000u;
+    }
+    SpinLockRelease(lock);
+}
+// nv-aux lock held (nv_layer.cpp, after a layer swap): no kicked copy reads the old layer after this.
+void NvLayerRetireLocked(){if(g_presenter[0].ceInflight)(void)CeFinishLocked(kCeWaitUs);}
+CompositorPrimaryPresenter MakePresenterOps(){CompositorPrimaryPresenter o{NvPrimaryPresent,NvPrimaryPoll};
+    o.directAvailable=NvDirectAvailable;o.setHole=NvSetHole;o.captureHole=NvCaptureHole;return o;}
+const CompositorPrimaryPresenter g_presenterOps=MakePresenterOps();
 // Panic: put A back on screen without waiting or locking (best effort).
 void NvPanicHook(){
     if(!g_runnersBuilt||!g_presenter[0].active||!g_driver.Live(0))return;
@@ -662,6 +749,12 @@ void PresenterStats(bool reset){
             ce.raw(",\"ce_wait_us\":");ce.dec(p.ceWaitNs/1000);ce.raw(",\"ce_poll_flips\":");ce.dec(p.ceFlipsFromPoll);ce.raw(",\"shadow_contig\":");ce.dec(p.shadowContig?1:0);ce.raw(",\"ce_frames\":");ce.dec(p.ceFrames);ce.raw(",\"ce_bytes\":");ce.dec(p.ceBytes);
             ce.raw(",\"ce_cpu_frames\":");ce.dec(p.ceCpuFrames);ce.raw(",\"ce_verified\":");ce.dec(p.ceVerified);ce.raw(",\"ce_mismatch\":");ce.dec(p.ceMismatch);
             ce.raw("}\n");DebugChannelSend(ce.t);
+            nvdisp::NvDisplayDriver<LiveBackend>::Line zc;const NvLayerStats ls=NvLayerStatsGet();
+            zc.raw("{\"nv_display\":\"stats_direct\",\"direct_frames\":");zc.dec(p.directFrames);zc.raw(",\"layer_ce\":");zc.dec(p.layerCeFrames);
+            zc.raw(",\"layer_cpu\":");zc.dec(p.layerCpuFrames);zc.raw(",\"hole_repairs\":");zc.dec(p.holeRepairs);zc.raw(",\"layer_missing\":");zc.dec(p.layerMissing);
+            zc.raw(",\"layer_verified\":");zc.dec(p.layerVerified);zc.raw(",\"hole\":[");zc.dec(uint32_t(p.hole.x0));zc.raw(",");zc.dec(uint32_t(p.hole.y0));zc.raw(",");zc.dec(uint32_t(p.hole.x1));zc.raw(",");zc.dec(uint32_t(p.hole.y1));
+            zc.raw("],\"layer_sets\":");zc.dec(ls.sets);zc.raw(",\"layer_detaches\":");zc.dec(ls.detaches);zc.raw(",\"layer_retires\":");zc.dec(ls.retires);
+            zc.raw("}\n");DebugChannelSend(zc.t);
         }
     }
     {   // compositor frame cost and escalations (zeroed with the window)
@@ -701,7 +794,7 @@ void DesktopStartThread(void*){
     bool ok=Configure();
     if(ok){g_driver.b=&g_backend;g_driver.r0=&g_runner;g_driver.r1=&g_head;ok=PresenterOnLocked();}
     SpinLockRelease(lock);
-    if(ok)CompositorSetPrimaryPresenter(&g_presenterOps);
+    if(ok){NvLayerSetRetireHook(NvLayerRetireLocked);CompositorSetPrimaryPresenter(&g_presenterOps);}
     else{KPrintf("nv-display: bring-up failed; the desktop stays on the GOP framebuffer\n");return;}
     // D3: the second monitor (conn2) joins unless /etc/nv-no-second-head exists. The head-1
     // preflight reads the sink's DPCD first and refuses without one; DP training takes
@@ -772,7 +865,7 @@ bool NvDispHandle(const char* command){
         if(strncmp(v,"desktop",7)==0){v+=7;while(*v==' ')++v;
             if(strncmp(v,"on1",3)==0){const bool ok=Presenter1OnLocked();SpinLockRelease(lock);if(ok)Head1Publish();PresenterStatus();return true;}
             if(strncmp(v,"off1",4)==0){Presenter1OffLocked();SpinLockRelease(lock);Head1Unpublish();PresenterStatus();return true;}
-            if(strncmp(v,"on",2)==0){const bool ok=PresenterOnLocked();SpinLockRelease(lock);if(ok)CompositorSetPrimaryPresenter(&g_presenterOps);PresenterStatus();return true;}
+            if(strncmp(v,"on",2)==0){const bool ok=PresenterOnLocked();SpinLockRelease(lock);if(ok){NvLayerSetRetireHook(NvLayerRetireLocked);CompositorSetPrimaryPresenter(&g_presenterOps);}PresenterStatus();return true;}
             if(strncmp(v,"off",3)==0){
                 if(g_presenter[1].active)Presenter1OffLocked();
                 g_presenter[0].active=false;SpinLockRelease(lock);Head1Unpublish();CompositorSetPrimaryPresenter(nullptr);
@@ -791,6 +884,12 @@ bool NvDispHandle(const char* command){
         g_driver.Command(rest+6);
         SpinLockRelease(lock);return true;
     }
+    if(strncmp(rest,"direct",6)==0&&(rest[6]==0||rest[6]==' ')){   // zero-copy step 2 A/B: direct on|off
+        const char* v=rest+6;while(*v==' ')++v;
+        if(!strncmp(v,"off",3))g_directOff=true;else if(!strncmp(v,"on",2))g_directOff=false;
+        SpinLockRelease(lock);
+        DebugChannelSend(g_directOff?"{\"nv_disp\":\"direct\",\"enabled\":false}\n":"{\"nv_disp\":\"direct\",\"enabled\":true}\n");
+        return true;}
     if(strncmp(rest,"snap",4)==0){NvDispSnapLocked("bridge");SpinLockRelease(lock);DebugChannelSend("{\"nv_disp\":\"snap\",\"msg\":\"see the kernel log (nv_snap lines)\"}\n");return true;}
     if(g_driver.AnyLive()&&strncmp(rest,"status",6)!=0&&strncmp(rest,"head1 status",12)!=0){
         DebugChannelSend("{\"nv_disp\":\"refused\",\"msg\":\"the resident driver owns the display (nv-disp driver down)\"}\n");

@@ -512,6 +512,38 @@ int main(int argc, char** argv) {
         assert(r.gpu.Vram32(0x400000 + 63 * 1280 + 255 * 4) == 0x10000000u + 63 * stride + 255);
         assert(r.gpu.Vram32(0x400000 + 4 * 1280 + 10 * 4) == 0);                         // outside the damage
         assert(r.CePresentOnce(cp, job, bb, &bytes) == 1 && cp.st.remaps == 1);        // same buffer: no remap
+        // zero-copy step 2: a client layer (contiguous sysmem, XRGB with junk X bytes) copied last,
+        // alpha forced through the component remap, over a shadow rect it overlaps
+        {
+            const uint32_t LW = 32, LH = 16, lstride = 48 * 4;
+            DmaRegion lb; assert(r.arena(lstride * LH, &lb));
+            uint32_t* lp = reinterpret_cast<uint32_t*>(lb.cpu);
+            for (uint32_t i = 0; i < lstride / 4 * LH; ++i) lp[i] = 0x00a00000u + i;   // X byte 0
+            NvCeJob lj = job;
+            lj.layer_phys = lb.bus; lj.layer_stride = lstride; lj.layer_dst = NvCeRect{20, 8, int32_t(20 + LW), int32_t(8 + LH)};
+            const size_t launches = r.rm.ce_launches;
+            r.rm.ce_order.clear();
+            { const int k = r.CePresentOnce(cp, lj, bb, &bytes);
+              if (k != 1) std::fprintf(stderr, "layer kick %d: %s refused=%u bus=0x%llx host=%s\n", k, cp.last_error, cp.st.layer_refused,
+                                      (unsigned long long)lb.bus, r.rm.host_error.c_str());
+              assert(k == 1); }
+            assert(r.rm.ce_launches == launches + 3 && r.rm.ce_remaps == 1 && cp.st.layer_copies == 1 && cp.st.layer_maps == 1);
+            assert(bytes == 64ull * 4 * 16 + 56ull * 4 * 24 + uint64_t(LW) * 4 * LH);
+            // the layer copy is the last launch, so it wins where it overlaps rect 0 (10,5)-(74,21)
+            assert(r.rm.ce_order.back() == kCeVaVram + 0x400000 + 8 * 1280 + 20 * 4);
+            assert(r.gpu.Vram32(0x400000 + 8 * 1280 + 20 * 4) == (0xff000000u | 0x00a00000u));
+            assert(r.gpu.Vram32(0x400000 + (8 + 15) * 1280 + (20 + 31) * 4) == (0xff000000u | (0x00a00000u + 15 * 48 + 31)));
+            assert(r.gpu.Vram32(0x400000 + 8 * 1280 + 19 * 4) == 0x10000000u + 8 * stride + 19);   // rect 0, just left of the layer
+            assert(r.gpu.Vram32(0x400000 + 20 * 1280 + 19 * 4) == 0x10000000u + 20 * stride + 19);
+            // the same BO again: its 2 MiB chunk is already mapped (no MMU invalidate)
+            assert(r.CePresentOnce(cp, lj, bb, &bytes) == 1 && cp.st.layer_maps == 1 && cp.st.layer_copies == 2);
+            // a layer-only job (no damage outside the hole) still copies the layer
+            NvCeJob lo = lj; lo.n = 0;
+            assert(r.CePresentOnce(cp, lo, bb, &bytes) == 1 && bytes == uint64_t(LW) * 4 * LH);
+            // a layer rectangle outside the target is refused (the CPU copies the frame)
+            NvCeJob bad2 = lj; bad2.layer_dst = NvCeRect{250, 60, 270, 70};
+            assert(r.CePresentOnce(cp, bad2, bb, &bytes) == 0 && cp.st.layer_refused == 1 && !cp.broken);
+        }
         // the compositor reallocates its back buffer: remapped at a fresh VA slot
         DmaRegion bb2; assert(r.arena(stride * H * 4, &bb2));
         uint32_t* px2 = reinterpret_cast<uint32_t*>(bb2.cpu);
