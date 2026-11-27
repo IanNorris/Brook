@@ -1935,10 +1935,10 @@ int main() {
         auto& socket=g_sockets[i];
         constexpr unsigned flights=2048;
         const uint8_t byte=42;
-        for(unsigned n=0;n<flights;++n)assert(TcpStoreOoo(socket,21+2*n,&byte,1,100));
+        for(unsigned n=0;n<flights;++n)assert(TcpStoreOoo(socket,21+2*n,&byte,1,100,g_tcpReceiveDiagnostics));
         assert(socket.tcpOooBytes==flights);
         assert(TcpReceiveFree(socket)==Socket::RX_DEFAULT);
-        assert(!TcpStoreOoo(socket,20+Socket::RX_DEFAULT,&byte,1,100));
+        assert(!TcpStoreOoo(socket,20+Socket::RX_DEFAULT,&byte,1,100,g_tcpReceiveDiagnostics));
         TcpReapOoo(socket,30100);
         assert(socket.tcpOooBytes==0);
     }
@@ -1980,8 +1980,8 @@ int main() {
     {
         auto& socket=g_sockets[i];
         const uint8_t first[]={2,3,4}, second[]={99,5,6}, prefix[]={0,1};
-        assert(TcpStoreOoo(socket,22,first,sizeof(first),100));
-        assert(TcpStoreOoo(socket,24,second,sizeof(second),100));
+        assert(TcpStoreOoo(socket,22,first,sizeof(first),100,g_tcpReceiveDiagnostics));
+        assert(TcpStoreOoo(socket,24,second,sizeof(second),100,g_tcpReceiveDiagnostics));
         assert(socket.tcpOooBytes==5);
         TcpEnqueueData(socket,prefix,sizeof(prefix));
         socket.tcpRcvNxt+=sizeof(prefix);
@@ -2126,7 +2126,7 @@ int main() {
         for (uint32_t n=0;n<drain;++n)data[n]=static_cast<uint8_t>(n);
         TcpEnqueueData(s,data,drain);
         const uint8_t future[]={4,5,6,7};
-        assert(TcpStoreOoo(s,s.tcpRcvNxt+1,future,sizeof(future),100));
+        assert(TcpStoreOoo(s,s.tcpRcvNxt+1,future,sizeof(future),100,g_tcpReceiveDiagnostics));
         assert(SockRecv(i,read,drain,true)==int(drain) && !memcmp(data,read,drain));
         assert(s.rxCapacity==2*Socket::RX_DEFAULT && SockGetReceiveBuffer(i)==int(s.rxCapacity));
         assert(s.tcpOooBytes==sizeof(future));
