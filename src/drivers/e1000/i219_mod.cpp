@@ -113,7 +113,7 @@ constexpr uint32_t PacketPages = RingSize * BufferSize / PageSize;
 // driver polls (no INTx line), and a 128-entry ring overflowed between 5 ms polls (12% of
 // segments arrived out of order, the NIC's missed-packet counter took the drops). The
 // descriptors (16 KiB) are physically contiguous; TX keeps the shared 128-entry ring.
-constexpr uint16_t RxRingSize = 1024;
+constexpr uint16_t RxRingSize = 4096;   // e1000e maximum; 1024 still missed ~1% at 608 Mbit/s (27 Nov)
 static_assert((RxRingSize & (RxRingSize - 1)) == 0 && RxRingSize * 16 % 4096 == 0);
 constexpr uint32_t RxDescriptorPages = RxRingSize * 16 / PageSize, RxPacketPages = RxRingSize * BufferSize / PageSize;
 inline uint16_t NextRx(uint16_t index) { return (index + 1) & (RxRingSize - 1); }
@@ -525,7 +525,7 @@ void Poll(NetIf* nif)
     auto* descriptors = reinterpret_cast<RxDescriptor*>(g_rxDma.descriptors.raw());
     uint16_t last = g_rx.next;
     uint32_t count = 0;
-    for (; count < RxRingSize; ++count) {
+    for (; count < 512; ++count) {   // bounded per call; net_poll calls 16 times per wake
         const uint16_t slot = g_rx.next;
         auto& descriptor = descriptors[slot];
         const uint8_t status = __atomic_load_n(&descriptor.status, __ATOMIC_ACQUIRE);

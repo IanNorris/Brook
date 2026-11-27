@@ -1810,7 +1810,7 @@ void NetStartPollThread()
                 SchedulerBlock(self);
             }
         }
-    }, nullptr, 2 /* NORMAL priority — same as user processes */);
+    }, nullptr, 1 /* above user threads (27 Nov): a polled NIC drops frames when net_poll is held off */);
     if (pollThread) {
         g_netPollThread = pollThread;
         SchedulerAddProcess(pollThread);
