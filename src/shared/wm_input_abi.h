@@ -11,6 +11,9 @@
 #define BROOK_POINTER_TIMELINE_DELIVERY 1u
 #define BROOK_WM_CREATE_FLAG_CAPTURE_EXCLUDED 16u
 #define BROOK_SYS_WM_EXCLUDE_CAPTURE 0xB28
+// WM_SET_CONTENT_PROCESS(wmId, pid): the provider names the process whose
+// content an owned window shows; used only to match launch feedback.
+#define BROOK_SYS_WM_SET_CONTENT_PROCESS 0xB2C
 #define BROOK_WM_POLICY_TITLE_BYTES 4096
 #define BROOK_WM_SCROLL_FINE    0x20u
 #define BROOK_WM_SCROLL_FINGER  0x40u

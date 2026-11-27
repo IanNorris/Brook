@@ -176,7 +176,7 @@ stdenv.mkDerivation {
     # helper accepts SendEvent to exercise the remaining association lifecycle.
     $CC -O2 -UNDEBUG -Wall -Wextra -DBROOK_XWM_TEST_SYNTHETIC_SERIAL -I${libxcb.dev}/include \
         -I${libxcb-cursor.dev}/include xwm-helper.c \
-        -L${libxcb}/lib -L${libxcb-cursor}/lib -lxcb -lxcb-composite -lxcb-cursor -o xwm-helper-fixture
+        -L${libxcb}/lib -L${libxcb-cursor}/lib -lxcb -lxcb-composite -lxcb-cursor -lxcb-res -o xwm-helper-fixture
     python3 xwm-helper-check.py --xvfb ${xorgserver}/bin/Xvfb \
         --helper "$PWD/xwm-helper-fixture" --fixture "$PWD/xwm-helper-test"
     BROOK_XWM_PROTOCOL=2 BROOK_XWM_SCALE=2 BROOK_XWAYLAND_SCALED_APPS="other, brook-scaled-test" \
@@ -254,7 +254,7 @@ stdenv.mkDerivation {
         -Wl,-rpath,${wayland}/lib:${stdenv.cc.libc}/lib${if enableVulkanCompositor then ":${vulkanLoader}/lib" else ""} \
         -o waylandd
     $CC -O2 -Wall -Wextra -I${libxcb.dev}/include -I${libxcb-cursor.dev}/include xwm-helper.c \
-        -L${libxcb}/lib -L${libxcb-cursor}/lib -lxcb -lxcb-composite -lxcb-cursor -o brook-xwm
+        -L${libxcb}/lib -L${libxcb-cursor}/lib -lxcb -lxcb-composite -lxcb-cursor -lxcb-res -o brook-xwm
   '';
 
   installPhase = ''

@@ -16,6 +16,7 @@ static uint32_t pixels[64][64*64],next_window,created,destroyed,resized,placed;
 static uint32_t create_flags[64],decoration_changes,moves,edge_resizes;
 /* WM_SET_FULLSCREEN: ENOSYS (older kernels, the fallback) unless enabled. */
 static int kernel_fullscreen;static BrookWindowState kernel_saved[64];
+static long content_window,content_pid;static unsigned content_reports;
 static long bridge_syscall(long number,...) {
     va_list ap;va_start(ap,number);long result=0;
     if (number==BROOK_SYS_WM_CREATE_WINDOW) {
@@ -73,6 +74,8 @@ static long bridge_syscall(long number,...) {
         long id=va_arg(ap,long);native[id].flags|=BROOK_WINDOW_STATE_MINIMIZED;
     } else if (number==BROOK_SYS_WM_GET_SCREEN_INFO) {
         uint32_t *out=(void *)va_arg(ap,long);out[0]=48;out[1]=40;
+    } else if (number==BROOK_SYS_WM_SET_CONTENT_PROCESS) {
+        content_window=va_arg(ap,long);content_pid=va_arg(ap,long);++content_reports;
     } else if (number==0xB06) { errno=ENOSYS;result=-1; }
     va_end(ap);return result;
 }
@@ -178,6 +181,12 @@ int main(int argc,char **argv) {
     focus_reconcile();assert(command_from_peer(peer,&rx,BXWM_FOCUS).window==123);
     focus_reconcile();no_command(peer,&rx);
     xwayland_window_event(s,WM_EVT_CLOSE_REQUESTED);command_from_peer(peer,&rx,BXWM_CLOSE);
+    // The X client's PID names the process behind the native window, once per
+    // native window, so its launch's "Starting:" feedback can end.
+    struct bxwm_message pid_message=state;pid_message.type=BXWM_CLIENT_PID;pid_message.x=4321;
+    assert(xwayland_accept_message(&pid_message) && content_reports==1 && content_window==id && content_pid==4321);
+    assert(xwayland_accept_message(&pid_message) && content_reports==1);
+    pid_message.x=0;assert(!bxwm_valid(&pid_message,g_xwayland_generation,1));
     struct bxwm_message dead=state;dead.type=BXWM_DESTROY;dead.identity=999;
     assert(xwayland_accept_message(&dead) && s->wm_id==id);
     state.flags=0;assert(xwayland_accept_message(&state));assert(!s->wm_id && destroyed==2);

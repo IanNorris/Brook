@@ -185,6 +185,10 @@ struct Window
     uint16_t    clientPid;      // Connection-origin TGID; never signal authority.
     uint64_t    clientIncarnation;
     uint64_t    clientLaunchId;
+    // Launch token of the process whose content the provider reports this
+    // window shows (an X11 client behind the shared Xwayland). Matches launch
+    // feedback only; no client-origin or signal authority.
+    uint64_t    contentLaunchId;
     char        taskbarCatalogId[33]; // exact catalog identity learned from an owned launch
     WmClientOrigin clientOrigin;
     int16_t     x, y;           // window position (outer top-left, including chrome)
@@ -802,6 +806,7 @@ static constexpr uint32_t WM_RESIZE_FULLSCREEN = 4; // never with MAXIMIZED
 bool WmPushWmEvent(Window* win, uint8_t type, int16_t x = 0, int16_t y = 0, uint32_t resizeFlags = 0);
 // Kernel-authenticated socket origin, associated by the provider. Immutable
 // after the first registration, and only for a window owned by that provider.
+bool WmSetContentProcess(Process* provider,uint32_t wmId,uint16_t pid);
 bool WmRegisterClientOrigin(Process* provider,uint32_t wmId,uint16_t clientPid,
                             uint64_t incarnation,uint64_t launchId);
 

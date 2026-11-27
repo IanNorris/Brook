@@ -582,6 +582,19 @@ int64_t sys_brook_wm_pointer_timeline(uint64_t op, uint64_t wmId, uint64_t type,
 #endif
 }
 
+// 0xB2C: WM_SET_CONTENT_PROCESS(wmId, pid). The provider of an owned window
+// (waylandd for an X11 window of its Xwayland) names the process whose content
+// it shows. Only that process's launch token is recorded, so the launch it
+// belongs to can end its feedback; no origin, ownership or signal authority.
+int64_t sys_brook_wm_set_content_process(uint64_t wmId, uint64_t pid, uint64_t,
+                                         uint64_t, uint64_t, uint64_t)
+{
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    if (!wmId || wmId > WM_MAX_WINDOWS || !pid || pid > 0xffffULL) return -EINVAL;
+    return brook::WmSetContentProcess(proc, static_cast<uint32_t>(wmId), static_cast<uint16_t>(pid)) ? 0 : -ESRCH;
+}
+
 // 0xB28: irrevocably exclude one owned window from capture.
 int64_t sys_brook_wm_exclude_capture(uint64_t wmId, uint64_t, uint64_t,
                                      uint64_t, uint64_t, uint64_t)
